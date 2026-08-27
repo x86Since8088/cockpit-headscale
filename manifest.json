@@ -1,0 +1,32 @@
+{
+    "version": "1.0.0",
+    "requires": {
+        "cockpit": "266"
+    },
+    "menu": {
+        "index": {
+            "label": "Headscale",
+            "order": 55,
+            "keywords": [
+                {
+                    "matches": [
+                        "headscale",
+                        "tailscale",
+                        "tailnet",
+                        "vpn",
+                        "wireguard",
+                        "mesh",
+                        "overlay network",
+                        "node",
+                        "preauthkey",
+                        "preauth key",
+                        "api key",
+                        "route",
+                        "subnet router",
+                        "exit node"
+                    ]
+                }
+            ]
+        }
+    }
+}

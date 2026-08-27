@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!--
+  cockpit-headscale - a dependency-free Cockpit page for headscale.
+  SPDX-License-Identifier: BSD-3-Clause
+-->
+<html id="headscale-page" class="pf-theme-dark" lang="en">
+<head>
+    <title translatable="yes">Headscale</title>
+    <meta charset="utf-8">
+    <meta name="description" content="Headscale control server status for Cockpit">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <link rel="stylesheet" href="headscale.css">
+    <script type="text/javascript" src="../base1/cockpit.js"></script>
+    <!--
+      Loaded in <head> rather than at the end of <body> so its theme bootstrap
+      resolves light/dark before the first paint. It defers its own DOM work
+      until DOMContentLoaded, so this is safe.
+    -->
+    <script type="text/javascript" src="headscale.js"></script>
+</head>
+
+<body>
+    <div id="app" class="hs-app">
+        <div class="hs-boot" id="boot">Loading&#8230;</div>
+    </div>
+    <div id="modal-root"></div>
+</body>
+</html>

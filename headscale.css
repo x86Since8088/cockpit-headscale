@@ -1,0 +1,553 @@
+/*
+ * cockpit-headscale styles.
+ *
+ * Theme strategy: every colour is a token defined on bare :root (light).
+ * The dark values are redefined twice -- once behind prefers-color-scheme for
+ * viewers on "system", once behind Cockpit's explicit .pf-v6-theme-dark /
+ * .pf-theme-dark class so the shell's light/dark toggle wins in both
+ * directions. No colour is ever defined *only* inside a media query.
+ */
+
+:root {
+    color-scheme: light;
+
+    --hs-bg:            #ffffff;
+    --hs-bg-sunken:     #f2f2f2;
+    --hs-bg-raised:     #ffffff;
+    --hs-bg-hover:      #f0f0f0;
+    --hs-border:        #d2d2d2;
+    --hs-border-strong: #b8bbbe;
+
+    --hs-fg:            #151515;
+    /* Darker than PatternFly's #6a6e73: that lands at 4.4:1 on the tinted
+       banner backgrounds used here, just short of WCAG AA for body text. */
+    --hs-fg-muted:      #5e6266;
+    --hs-fg-link:       #0066cc;
+
+    --hs-ok-fg:         #1f6b34;
+    --hs-ok-bg:         #e7f5ea;
+    --hs-ok-border:     #9bd4a8;
+
+    --hs-warn-fg:       #795600;
+    --hs-warn-bg:       #fdf7e7;
+    --hs-warn-border:   #f0ab00;
+
+    --hs-err-fg:        #a30000;
+    --hs-err-bg:        #faeaea;
+    --hs-err-border:    #f0a3a3;
+
+    --hs-info-fg:       #0043a0;
+    --hs-info-bg:       #e7f1fa;
+    --hs-info-border:   #92c5f9;
+
+    --hs-idle-fg:       #4d5258;
+    --hs-idle-bg:       #f0f0f0;
+    --hs-idle-border:   #c7c7c7;
+
+    --hs-accent:        #0066cc;
+    --hs-accent-fg:     #ffffff;
+
+    --hs-mono: ui-monospace, "SFMono-Regular", "Menlo", "Consolas",
+               "Liberation Mono", "DejaVu Sans Mono", monospace;
+    --hs-sans: "RedHatText", "Red Hat Text", -apple-system, BlinkMacSystemFont,
+               "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+/*
+ * Fallback only. headscale.js resolves Cockpit's light/dark preference (which
+ * may be an explicit "Light" on a dark desktop) and adds .hs-theme-managed as
+ * soon as it runs, which switches this block off. It therefore only applies
+ * before the script executes, or if the page is opened outside Cockpit.
+ */
+@media (prefers-color-scheme: dark) {
+    :root:not(.hs-theme-managed) {
+        color-scheme: dark;
+
+        --hs-bg:            #1b1d21;
+        --hs-bg-sunken:     #131518;
+        --hs-bg-raised:     #24272c;
+        --hs-bg-hover:      #2e3238;
+        --hs-border:        #3d4147;
+        --hs-border-strong: #575d64;
+
+        --hs-fg:            #e0e0e0;
+        --hs-fg-muted:      #a3a8ad;
+        --hs-fg-link:       #7cc0ff;
+
+        --hs-ok-fg:         #7ddc95;
+        --hs-ok-bg:         #1c2b20;
+        --hs-ok-border:     #3d6b48;
+
+        --hs-warn-fg:       #f0c561;
+        --hs-warn-bg:       #2e2716;
+        --hs-warn-border:   #7a5f14;
+
+        --hs-err-fg:        #ff9a9a;
+        --hs-err-bg:        #2f1c1c;
+        --hs-err-border:    #7d3838;
+
+        --hs-info-fg:       #92c5f9;
+        --hs-info-bg:       #17242f;
+        --hs-info-border:   #3a5a7a;
+
+        --hs-idle-fg:       #b0b4b9;
+        --hs-idle-bg:       #2a2d32;
+        --hs-idle-border:   #4a4e54;
+
+        --hs-accent:        #4394e5;
+        --hs-accent-fg:     #10141a;
+    }
+}
+
+/*
+ * The authoritative path: the class Cockpit itself uses for dark mode, set
+ * here by headscale.js from the shell's resolved preference. Because the
+ * fallback above is disabled once that runs, this single class decides.
+ */
+:root.pf-v6-theme-dark {
+    color-scheme: dark;
+
+    --hs-bg:            #1b1d21;
+    --hs-bg-sunken:     #131518;
+    --hs-bg-raised:     #24272c;
+    --hs-bg-hover:      #2e3238;
+    --hs-border:        #3d4147;
+    --hs-border-strong: #575d64;
+
+    --hs-fg:            #e0e0e0;
+    --hs-fg-muted:      #a3a8ad;
+    --hs-fg-link:       #7cc0ff;
+
+    --hs-ok-fg:         #7ddc95;
+    --hs-ok-bg:         #1c2b20;
+    --hs-ok-border:     #3d6b48;
+
+    --hs-warn-fg:       #f0c561;
+    --hs-warn-bg:       #2e2716;
+    --hs-warn-border:   #7a5f14;
+
+    --hs-err-fg:        #ff9a9a;
+    --hs-err-bg:        #2f1c1c;
+    --hs-err-border:    #7d3838;
+
+    --hs-info-fg:       #92c5f9;
+    --hs-info-bg:       #17242f;
+    --hs-info-border:   #3a5a7a;
+
+    --hs-idle-fg:       #b0b4b9;
+    --hs-idle-bg:       #2a2d32;
+    --hs-idle-border:   #4a4e54;
+
+    --hs-accent:        #4394e5;
+    --hs-accent-fg:     #10141a;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--hs-bg-sunken);
+    color: var(--hs-fg);
+    font-family: var(--hs-sans);
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.hs-app {
+    padding: 1rem;
+    max-width: 1400px;
+}
+
+.hs-boot { color: var(--hs-fg-muted); padding: 1rem; }
+
+/* ---------- header ---------- */
+
+.hs-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+}
+
+.hs-header h1 {
+    font-size: 1.4rem;
+    font-weight: 500;
+    margin: 0;
+    color: var(--hs-fg);
+}
+
+.hs-header .hs-spacer { flex: 1 1 auto; }
+
+/* ---------- cards ---------- */
+
+.hs-card {
+    background: var(--hs-bg-raised);
+    border: 1px solid var(--hs-border);
+    border-radius: 6px;
+    margin-bottom: 1rem;
+    overflow: hidden;
+}
+
+.hs-card-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--hs-border);
+    background: var(--hs-bg-raised);
+}
+
+.hs-card-head h2 {
+    font-size: 1.05rem;
+    font-weight: 500;
+    margin: 0;
+}
+
+.hs-card-head .hs-spacer { flex: 1 1 auto; }
+
+.hs-card-body { padding: 1rem; }
+.hs-card-body.hs-flush { padding: 0; }
+
+.hs-sub {
+    color: var(--hs-fg-muted);
+    font-size: 0.875rem;
+    margin: 0.25rem 0 0;
+}
+
+/* ---------- banners ---------- */
+
+.hs-banner {
+    border: 1px solid var(--hs-info-border);
+    border-left-width: 4px;
+    background: var(--hs-info-bg);
+    color: var(--hs-fg);
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+    margin-bottom: 1rem;
+}
+
+.hs-banner h2 {
+    margin: 0 0 0.35rem;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--hs-info-fg);
+}
+
+.hs-banner p { margin: 0 0 0.5rem; }
+.hs-banner p:last-child { margin-bottom: 0; }
+
+.hs-banner.warn   { border-color: var(--hs-warn-border); background: var(--hs-warn-bg); }
+.hs-banner.warn h2 { color: var(--hs-warn-fg); }
+.hs-banner.err    { border-color: var(--hs-err-border);  background: var(--hs-err-bg); }
+.hs-banner.err h2  { color: var(--hs-err-fg); }
+.hs-banner.ok     { border-color: var(--hs-ok-border);   background: var(--hs-ok-bg); }
+.hs-banner.ok h2   { color: var(--hs-ok-fg); }
+
+/* ---------- checklist ---------- */
+
+.hs-check {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+}
+
+.hs-check li {
+    display: grid;
+    grid-template-columns: 1.4rem 11rem 1fr;
+    gap: 0.5rem;
+    align-items: start;
+    padding: 0.3rem 0;
+    border-top: 1px solid var(--hs-border);
+}
+
+.hs-check li:first-child { border-top: none; }
+
+.hs-check .hs-mark { font-weight: 700; text-align: center; }
+.hs-check .hs-mark.ok   { color: var(--hs-ok-fg); }
+.hs-check .hs-mark.bad  { color: var(--hs-err-fg); }
+.hs-check .hs-mark.warn { color: var(--hs-warn-fg); }
+.hs-check .hs-mark.unk  { color: var(--hs-fg-muted); }
+
+.hs-check .hs-label { color: var(--hs-fg-muted); }
+.hs-check .hs-value { word-break: break-word; }
+
+@media (max-width: 640px) {
+    .hs-check li { grid-template-columns: 1.4rem 1fr; }
+    .hs-check .hs-label { grid-column: 2; }
+    .hs-check .hs-value { grid-column: 2; }
+}
+
+/* ---------- tabs ---------- */
+
+.hs-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    border-bottom: 1px solid var(--hs-border);
+    margin-bottom: 1rem;
+}
+
+.hs-tab {
+    appearance: none;
+    background: transparent;
+    border: none;
+    border-bottom: 3px solid transparent;
+    color: var(--hs-fg-muted);
+    font: inherit;
+    padding: 0.5rem 0.9rem;
+    cursor: pointer;
+    border-radius: 4px 4px 0 0;
+}
+
+.hs-tab:hover { background: var(--hs-bg-hover); color: var(--hs-fg); }
+
+.hs-tab[aria-selected="true"] {
+    color: var(--hs-fg);
+    border-bottom-color: var(--hs-accent);
+    font-weight: 600;
+}
+
+.hs-tab:focus-visible { outline: 2px solid var(--hs-accent); outline-offset: -2px; }
+
+.hs-tab .hs-count {
+    display: inline-block;
+    margin-left: 0.4rem;
+    background: var(--hs-idle-bg);
+    color: var(--hs-idle-fg);
+    border: 1px solid var(--hs-idle-border);
+    border-radius: 999px;
+    font-size: 0.75rem;
+    padding: 0 0.4rem;
+}
+
+/* ---------- tables ---------- */
+
+.hs-table-wrap { overflow-x: auto; }
+
+table.hs-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+}
+
+table.hs-table th,
+table.hs-table td {
+    text-align: left;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--hs-border);
+    vertical-align: top;
+    white-space: nowrap;
+}
+
+table.hs-table th {
+    color: var(--hs-fg-muted);
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    background: var(--hs-bg-sunken);
+    position: sticky;
+    top: 0;
+}
+
+table.hs-table tbody tr:hover { background: var(--hs-bg-hover); }
+table.hs-table tbody tr:last-child td { border-bottom: none; }
+
+td.hs-wrap { white-space: normal; }
+td.hs-actions { text-align: right; white-space: nowrap; }
+
+.hs-mono { font-family: var(--hs-mono); font-size: 0.85em; }
+
+.hs-iplist { display: flex; flex-direction: column; gap: 0.1rem; }
+
+.hs-empty {
+    padding: 1.5rem 1rem;
+    color: var(--hs-fg-muted);
+    text-align: center;
+}
+
+/* ---------- pills ---------- */
+
+.hs-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    border-radius: 999px;
+    padding: 0.05rem 0.55rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    border: 1px solid var(--hs-idle-border);
+    background: var(--hs-idle-bg);
+    color: var(--hs-idle-fg);
+    white-space: nowrap;
+}
+
+.hs-pill.ok   { background: var(--hs-ok-bg);   color: var(--hs-ok-fg);   border-color: var(--hs-ok-border); }
+.hs-pill.warn { background: var(--hs-warn-bg); color: var(--hs-warn-fg); border-color: var(--hs-warn-border); }
+.hs-pill.err  { background: var(--hs-err-bg);  color: var(--hs-err-fg);  border-color: var(--hs-err-border); }
+.hs-pill.info { background: var(--hs-info-bg); color: var(--hs-info-fg); border-color: var(--hs-info-border); }
+
+.hs-pill::before {
+    content: "";
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: currentColor;
+    flex: none;
+}
+
+.hs-pill.hs-nodot::before { display: none; }
+
+/* ---------- buttons ---------- */
+
+.hs-btn {
+    appearance: none;
+    font: inherit;
+    font-size: 0.875rem;
+    padding: 0.3rem 0.8rem;
+    border-radius: 4px;
+    border: 1px solid var(--hs-accent);
+    background: transparent;
+    color: var(--hs-fg-link);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.hs-btn:hover:not(:disabled) { background: var(--hs-bg-hover); }
+.hs-btn:focus-visible { outline: 2px solid var(--hs-accent); outline-offset: 1px; }
+
+.hs-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.hs-btn.primary {
+    background: var(--hs-accent);
+    color: var(--hs-accent-fg);
+    border-color: var(--hs-accent);
+}
+
+.hs-btn.danger {
+    border-color: var(--hs-err-border);
+    color: var(--hs-err-fg);
+}
+
+.hs-btn.danger.primary {
+    background: var(--hs-err-fg);
+    color: var(--hs-bg);
+    border-color: var(--hs-err-fg);
+}
+
+.hs-btn.link {
+    border-color: transparent;
+    padding-inline: 0.4rem;
+}
+
+.hs-btn.sm { font-size: 0.8rem; padding: 0.15rem 0.5rem; }
+
+.hs-btnrow { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+
+/* ---------- code / pre ---------- */
+
+pre.hs-pre {
+    font-family: var(--hs-mono);
+    font-size: 0.8rem;
+    background: var(--hs-bg-sunken);
+    border: 1px solid var(--hs-border);
+    border-radius: 4px;
+    padding: 0.6rem 0.75rem;
+    overflow-x: auto;
+    margin: 0.5rem 0 0;
+    color: var(--hs-fg);
+    white-space: pre;
+}
+
+code.hs-code {
+    font-family: var(--hs-mono);
+    font-size: 0.85em;
+    background: var(--hs-bg-sunken);
+    border: 1px solid var(--hs-border);
+    border-radius: 3px;
+    padding: 0.05rem 0.3rem;
+}
+
+/* ---------- definition grid ---------- */
+
+.hs-dl {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.35rem 1rem;
+    margin: 0;
+}
+
+.hs-dl dt { color: var(--hs-fg-muted); }
+.hs-dl dd { margin: 0; word-break: break-word; }
+
+@media (max-width: 640px) {
+    .hs-dl { grid-template-columns: 1fr; gap: 0 ; }
+    .hs-dl dd { margin-bottom: 0.5rem; }
+}
+
+/* ---------- modal ---------- */
+
+.hs-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(3, 3, 3, 0.62);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    z-index: 500;
+}
+
+.hs-modal {
+    background: var(--hs-bg-raised);
+    color: var(--hs-fg);
+    border: 1px solid var(--hs-border-strong);
+    border-radius: 6px;
+    box-shadow: 0 8px 32px rgba(3, 3, 3, 0.4);
+    max-width: 34rem;
+    width: 100%;
+    max-height: 90vh;
+    overflow-y: auto;
+}
+
+.hs-modal-head {
+    padding: 1rem 1rem 0.5rem;
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+
+.hs-modal-body { padding: 0 1rem 1rem; }
+
+.hs-modal-foot {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    border-top: 1px solid var(--hs-border);
+}
+
+/* ---------- misc ---------- */
+
+.hs-muted { color: var(--hs-fg-muted); }
+.hs-nowrap { white-space: nowrap; }
+.hs-inline-note { font-size: 0.8rem; color: var(--hs-fg-muted); }
+
+.hs-spin {
+    display: inline-block;
+    width: 0.85rem;
+    height: 0.85rem;
+    border: 2px solid var(--hs-border-strong);
+    border-top-color: var(--hs-accent);
+    border-radius: 50%;
+    animation: hs-rotate 0.8s linear infinite;
+    vertical-align: -0.1rem;
+}
+
+@keyframes hs-rotate { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+    .hs-spin { animation-duration: 3s; }
+}

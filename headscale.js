@@ -850,6 +850,374 @@
     }
 
     /* ------------------------------------------------------------------ *
+     * Schema-driven forms
+     *
+     * Declarative form descriptors: each field carries id/label/type/
+     * required/help, and submit() builds the exact argv shown to the
+     * operator in the dialog before anything runs -- the same gate every
+     * other mutation in this plugin goes through. Every successful submit
+     * ends in refresh(), so the tables repaint from freshly-read data.
+     * ------------------------------------------------------------------ */
+
+    var EXPIRATIONS = ["1h", "8h", "24h", "7d", "30d", "90d"];
+
+    var FORM_SCHEMAS = {
+        userCreate: {
+            title: "New user",
+            intro: "Creates a headscale user. Nodes and pre-auth keys belong to a user.",
+            fields: [
+                { id: "name", label: "Username", type: "text", required: true,
+                  placeholder: "amara", pattern: "^[a-z0-9][a-z0-9.@_-]*$",
+                  patternHint: "lowercase letters, digits and . @ _ -",
+                  help: "The login name; DNS-safe and unique." },
+                { id: "display", label: "Display name", type: "text",
+                  help: "Cosmetic; shown in dashboards." },
+                { id: "email", label: "Email", type: "text",
+                  help: "Optional; matched by OIDC logins." }
+            ],
+            submitLabel: "Create user",
+            build: function (v) {
+                var a = [state.bin, "users", "create", v.name];
+                if (v.display) a.push("-d", v.display);
+                if (v.email) a.push("-e", v.email);
+                return [a];
+            }
+        },
+
+        preauthCreate: {
+            title: "New pre-auth key",
+            intro: "Generates a key that lets a device join the tailnet without an interactive login. The key is a credential and is shown only once, right after creation.",
+            fields: [
+                { id: "user", label: "User", type: "select", required: true,
+                  optionsFrom: "users",
+                  help: "Nodes registered with the key belong to this user." },
+                { id: "expiration", label: "Expiration", type: "select",
+                  options: EXPIRATIONS, value: "24h",
+                  help: "How long the key can be used to register nodes." },
+                { id: "reusable", label: "Reusable", type: "boolean",
+                  help: "May register more than one node." },
+                { id: "ephemeral", label: "Ephemeral", type: "boolean",
+                  help: "Nodes registered with it vanish when they disconnect." },
+                { id: "tags", label: "ACL tags", type: "list", span2: true,
+                  placeholder: "tag:server",
+                  itemPattern: "^tag:[a-z0-9-]+$", itemHint: "tag:name",
+                  help: "One per line; assigned automatically to nodes joining with this key." }
+            ],
+            submitLabel: "Generate key",
+            secretResult: {
+                label: "The new pre-auth key — shown only this once:",
+                note: "Copy it now. This page never displays full key values again."
+            },
+            build: function (v) {
+                var a = [state.bin, "preauthkeys", "create",
+                         "-u", v.user, "-e", v.expiration];
+                if (v.reusable) a.push("--reusable");
+                if (v.ephemeral) a.push("--ephemeral");
+                if (v.tags && v.tags.length) a.push("--tags", v.tags.join(","));
+                return [a];
+            }
+        },
+
+        apikeyCreate: {
+            title: "New API key",
+            intro: "Creates a key for headscale's HTTP API. headscale stores only a hash — the full key is shown once, right after creation, and cannot be recovered.",
+            fields: [
+                { id: "expiration", label: "Expiration", type: "select",
+                  options: ["24h", "90d", "180d", "365d"], value: "90d",
+                  help: "The key stops authenticating after this." }
+            ],
+            submitLabel: "Create key",
+            secretResult: {
+                label: "The new API key — shown only this once:",
+                note: "Copy it now. Only the prefix will appear in the list."
+            },
+            build: function (v) {
+                return [[state.bin, "apikeys", "create", "-e", v.expiration]];
+            }
+        }
+    };
+
+    // Node settings is per-node, so its schema is built from the node record.
+    function nodeEditSchema(node) {
+        var currentTags = (node.forced_tags || []).slice();
+        return {
+            title: "Node settings — " + (node.given_name || node.name),
+            intro: "Rename the node or replace its forced ACL tags. Only the parts you change are sent.",
+            fields: [
+                { id: "rename", label: "Name", type: "text",
+                  value: node.given_name || node.name || "",
+                  pattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+                  patternHint: "DNS label: lowercase letters, digits, dashes",
+                  help: "The node's given name, used in MagicDNS." },
+                { id: "tags", label: "Forced ACL tags", type: "list", span2: true,
+                  value: currentTags.join("\n"),
+                  itemPattern: "^tag:[a-z0-9-]+$", itemHint: "tag:name",
+                  help: "One per line. Replaces the node's whole tag set; leaving it unchanged sends nothing. Tags must be defined in the ACL policy." }
+            ],
+            submitLabel: "Apply",
+            build: function (v) {
+                var cmds = [];
+                var newName = (v.rename || "").trim();
+                if (newName && newName !== (node.given_name || node.name))
+                    cmds.push([state.bin, "nodes", "rename", newName,
+                               "-i", String(node.id)]);
+                var newTags = v.tags || [];
+                if (newTags.join(",") !== currentTags.join(",") && newTags.length)
+                    cmds.push([state.bin, "nodes", "tag",
+                               "-i", String(node.id), "-t", newTags.join(",")]);
+                return cmds;
+            },
+            emptyBuildMessage: "Nothing would change — edit the name or the tags first."
+        };
+    }
+
+    function selectOptions(field) {
+        if (field.optionsFrom === "users")
+            return (state.users || []).map(function (u) {
+                return { value: String(u.id), label: u.name || String(u.id) };
+            });
+        return (field.options || []).map(function (o) {
+            return typeof o === "string" ? { value: o, label: o } : o;
+        });
+    }
+
+    /*
+     * The generic form dialog. Collect/validate/preview are pure functions of
+     * the schema, so adding a form is adding a descriptor above -- no new UI
+     * code. The live command preview keeps the plugin's invariant: the
+     * operator sees the exact argv before pressing the primary button.
+     */
+    function schemaForm(schema) {
+        var root = document.getElementById("modal-root");
+        clear(root);
+
+        var getters = {};
+        var errNodes = {};
+        var previewPre = el("pre", { class: "hs-pre" });
+        var errBox = el("div");
+        var busyNote = el("div", { class: "hs-inline-note" });
+        var submitBtn;
+
+        function close() {
+            clear(root);
+            document.removeEventListener("keydown", onKey);
+        }
+
+        function onKey(ev) {
+            if (ev.key === "Escape")
+                close();
+        }
+
+        function collect() {
+            var v = {};
+            for (var id in getters)
+                v[id] = getters[id]();
+            return v;
+        }
+
+        function validate(values) {
+            var ok = true;
+            schema.fields.forEach(function (f) {
+                clear(errNodes[f.id]);
+                var val = values[f.id];
+                var msg = null;
+                if (f.type === "list") {
+                    if (f.required && !val.length)
+                        msg = "At least one entry is required.";
+                    else if (f.itemPattern) {
+                        var re = new RegExp(f.itemPattern);
+                        for (var i = 0; i < val.length; i++) {
+                            if (!re.test(val[i])) {
+                                msg = "“" + val[i] + "” does not match " + (f.itemHint || f.itemPattern) + ".";
+                                break;
+                            }
+                        }
+                    }
+                } else if (f.type === "boolean") {
+                    /* nothing to validate */
+                } else {
+                    var s = String(val || "").trim();
+                    if (f.required && !s)
+                        msg = "Required.";
+                    else if (s && f.pattern && !new RegExp(f.pattern).test(s))
+                        msg = "Must be " + (f.patternHint || f.pattern) + ".";
+                }
+                if (msg) {
+                    ok = false;
+                    append(errNodes[f.id], el("div", { class: "hs-ferr", text: msg }));
+                }
+            });
+            return ok;
+        }
+
+        function commands(values) {
+            try {
+                return schema.build(values) || [];
+            } catch (e) {
+                return [];
+            }
+        }
+
+        function updatePreview() {
+            var cmds = commands(collect());
+            previewPre.textContent = cmds.length
+                ? cmds.map(function (a) { return a.join(" "); }).join("\n")
+                : "(no command yet)";
+        }
+
+        function fieldNode(f) {
+            var wrap = el("div", { class: "hs-field" + (f.span2 ? " hs-span2" : "") });
+            errNodes[f.id] = el("div");
+
+            var label = el("label", null, f.label,
+                f.required ? el("span", { class: "hs-req", text: "*" }) : null);
+
+            var control;
+            if (f.type === "select") {
+                control = el("select", { class: "hs-select", oninput: updatePreview });
+                selectOptions(f).forEach(function (o) {
+                    append(control, el("option", {
+                        value: o.value,
+                        selected: f.value === o.value ? true : null,
+                        text: o.label
+                    }));
+                });
+                getters[f.id] = function () { return control.value; };
+            } else if (f.type === "boolean") {
+                control = el("input", { type: "checkbox", oninput: updatePreview });
+                if (f.value) control.checked = true;
+                getters[f.id] = function () { return control.checked; };
+                append(wrap, [
+                    el("div", { class: "hs-checkrow" }, control, el("div", null, label)),
+                    f.help ? el("div", { class: "hs-help", text: f.help }) : null,
+                    errNodes[f.id]
+                ]);
+                return wrap;
+            } else if (f.type === "list") {
+                control = el("textarea", {
+                    class: "hs-textarea", rows: "3",
+                    placeholder: f.placeholder || "", oninput: updatePreview
+                });
+                if (f.value) control.value = f.value;
+                getters[f.id] = function () {
+                    return control.value.split("\n")
+                        .map(function (s) { return s.trim(); })
+                        .filter(Boolean);
+                };
+            } else {
+                control = el("input", {
+                    class: "hs-input", type: "text",
+                    placeholder: f.placeholder || "", oninput: updatePreview
+                });
+                if (f.value) control.value = f.value;
+                getters[f.id] = function () { return control.value; };
+            }
+
+            append(wrap, [label, control,
+                f.help ? el("div", { class: "hs-help", text: f.help }) : null,
+                errNodes[f.id]]);
+            return wrap;
+        }
+
+        function showSecret(output) {
+            clear(body);
+            append(body,
+                el("div", { class: "hs-banner ok" },
+                    el("h2", { text: "Done — data refreshed next" }),
+                    el("p", { text: schema.secretResult.label }),
+                    el("pre", { class: "hs-pre", text: (output || "").trim() }),
+                    el("p", { class: "hs-muted", text: schema.secretResult.note })));
+            clear(foot);
+            append(foot, el("button", {
+                class: "hs-btn primary",
+                onclick: function () { close(); refresh(); },
+                text: "Done"
+            }));
+        }
+
+        function onSubmit() {
+            var values = collect();
+            clear(errBox);
+            if (!validate(values))
+                return;
+            var cmds = commands(values);
+            if (!cmds.length) {
+                append(errBox, el("div", { class: "hs-banner warn" },
+                    el("p", { text: schema.emptyBuildMessage || "Nothing to run." })));
+                return;
+            }
+            submitBtn.disabled = true;
+            clear(busyNote);
+            append(busyNote, [el("span", { class: "hs-spin" }), " ", "Running…"]);
+
+            var lastOut = "";
+            var chain = Promise.resolve();
+            cmds.forEach(function (argv) {
+                chain = chain.then(function () {
+                    return run(argv).then(function (out) { lastOut = out; });
+                });
+            });
+            chain.then(function () {
+                clear(busyNote);
+                if (schema.secretResult) {
+                    showSecret(lastOut);
+                } else {
+                    close();
+                    refresh();
+                }
+            }).catch(function (err) {
+                var c = classify(err);
+                submitBtn.disabled = false;
+                clear(busyNote);
+                clear(errBox);
+                append(errBox, el("div", { class: "hs-banner err" },
+                    el("h2", { text: c.kind === "privilege"
+                        ? "Administrative access required"
+                        : "The command failed" }),
+                    el("p", { text: c.kind === "privilege"
+                        ? "This action needs administrative access and it was not granted, so nothing was changed."
+                        : "Nothing was changed. headscale reported:" }),
+                    c.msg ? el("pre", { class: "hs-pre", text: c.msg }) : null));
+            });
+        }
+
+        submitBtn = el("button", {
+            class: "hs-btn primary", onclick: onSubmit,
+            text: schema.submitLabel || "Submit"
+        });
+
+        var body = el("div", { class: "hs-modal-body" },
+            schema.intro ? el("p", { class: "hs-sub", text: schema.intro }) : null,
+            el("div", { class: "hs-form-grid" }, schema.fields.map(fieldNode)),
+            el("div", null,
+                el("div", { class: "hs-inline-note", text: "Command to be run:" }),
+                previewPre),
+            errBox,
+            busyNote);
+
+        var foot = el("div", { class: "hs-modal-foot" },
+            el("button", { class: "hs-btn", onclick: close, text: "Cancel" }),
+            submitBtn);
+
+        var dialog = el("div", { class: "hs-modal", role: "dialog", "aria-modal": "true" },
+            el("div", { class: "hs-modal-head", text: schema.title }),
+            body,
+            foot);
+
+        var backdrop = el("div", {
+            class: "hs-modal-backdrop",
+            onclick: function (ev) { if (ev.target === backdrop) close(); }
+        }, dialog);
+
+        root.appendChild(backdrop);
+        document.addEventListener("keydown", onKey);
+        updatePreview();
+        var first = dialog.querySelector("input, select, textarea");
+        if (first)
+            first.focus();
+    }
+
+    /* ------------------------------------------------------------------ *
      * Rendering: header and diagnostics
      * ------------------------------------------------------------------ */
 
@@ -1115,7 +1483,12 @@
         });
         return card("Users", "Each user owns nodes and pre-auth keys. In headscale 0.26 the JSON field name is the login name; the display name and email are only populated for OIDC users.",
             table(["ID", "Name", "Display name", "Email", "Nodes", "Pre-auth keys", "Created"],
-                rows, "No users exist yet. Create one with: headscale users create <name>"));
+                rows, "No users exist yet. Use “New user” above to create one."),
+            el("button", {
+                class: "hs-btn primary sm",
+                onclick: function () { schemaForm(FORM_SCHEMAS.userCreate); },
+                text: "New user"
+            }));
     }
 
     function nodeOnline(n) {
@@ -1148,6 +1521,10 @@
                     : el("span", { class: "hs-muted", text: "—" }));
 
             var actions = el("td", { class: "hs-actions" },
+                el("button", {
+                    class: "hs-btn sm", onclick: function () { schemaForm(nodeEditSchema(n)); },
+                    text: "Edit"
+                }), " ",
                 el("button", {
                     class: "hs-btn sm", onclick: function () { expireNode(n); },
                     text: "Expire"
@@ -1219,10 +1596,18 @@
                     })));
         });
 
+        var canCreate = !!(state.users && state.users.length);
         return card("Pre-auth keys",
             "Keys that let a device join the tailnet without an interactive login. Only a short prefix is shown — these are credentials, and headscale returns them in full over the CLI.",
             table(["ID", "Status", "User", "Key", "Flags", "Expires", "Created", "Actions"],
-                rows, "No pre-auth keys exist. Create one with: headscale preauthkeys create --user <id> --expiration 24h"));
+                rows, "No pre-auth keys exist. Use “New pre-auth key” above to create one."),
+            el("button", {
+                class: "hs-btn primary sm",
+                disabled: !canCreate,
+                title: canCreate ? null : "Create a user first — every key belongs to one",
+                onclick: function () { schemaForm(FORM_SCHEMAS.preauthCreate); },
+                text: "New pre-auth key"
+            }));
     }
 
     function renderApiKeys() {
@@ -1250,7 +1635,12 @@
         return card("API keys",
             "Keys for headscale's HTTP API. headscale only ever returns the prefix after creation — the secret itself is shown once, at creation time, and is not recoverable.",
             table(["ID", "Status", "Prefix", "Expires", "Last seen", "Created", "Actions"],
-                rows, "No API keys exist. Create one with: headscale apikeys create --expiration 90d"));
+                rows, "No API keys exist. Use “New API key” above to create one."),
+            el("button", {
+                class: "hs-btn primary sm",
+                onclick: function () { schemaForm(FORM_SCHEMAS.apikeyCreate); },
+                text: "New API key"
+            }));
     }
 
     /*

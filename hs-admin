@@ -1,0 +1,894 @@
+#!/bin/bash
+#
+# hs-admin - the ONLY root entry point for the Cockpit headscale plugin.
+#
+# Same contract as wg-admin (see cockpit-wireguard/docs/CONTRACT.md):
+#   - the plugin never runs raw commands; it calls this helper with a narrow verb
+#   - every verb prints JSON on stdout and NOTHING else
+#   - diagnostics, warnings and errors go to stderr
+#   - exit 0 = success; on failure stdout carries {"error": ...} and exit != 0
+#
+# Install:  /usr/local/sbin/hs-admin, mode 0755, root:root
+# Call as:  cockpit.spawn(["/usr/local/sbin/hs-admin", VERB, ...],
+#                         { superuser: "require", err: "message" })
+#
+# ---------------------------------------------------------------------------
+# Environment facts this helper absorbs so the plugin never has to know them
+# ---------------------------------------------------------------------------
+#
+#   * headscale here is the Canonical SNAP (0.26.1). /snap/bin/headscale is a
+#     snap wrapper (a symlink to /usr/bin/snap); the real binary lives at
+#     /snap/headscale/current/bin/headscale and the snap injects
+#     HEADSCALE_CONFIG=$SNAP_COMMON/config.yaml. The binary's own compiled-in
+#     default is /etc/headscale/config.yaml, which does NOT exist on this host,
+#     so every invocation must pass -c explicitly.
+#
+#   * The control socket is /var/snap/headscale/common/internal/headscale.sock
+#     inside a `drwx------ root root` directory. EVERY query needs root, even a
+#     read-only list.
+#
+#   * *** EMPTY LISTS COME BACK AS THE LITERAL JSON `null`, NOT `[]` ***
+#     `users list -o json`, `nodes list -o json` and `apikeys list -o json` all
+#     exit 0 and print `null` when the directory is empty. The CLI hands the
+#     bare Go slice to encoding/json and a nil slice marshals to null. Treating
+#     that as an error is wrong and costs hours. norm_list() folds it to [].
+#
+#   * `preauthkeys list` and `preauthkeys create` REQUIRE `--user` and the flag
+#     takes a NUMERIC ID, not a name. Without it: rc=1, `required flag(s)
+#     "user" not set`. resolve_user() does the name -> id lookup.
+#
+#   * There is NO top-level `routes` subcommand on 0.26. Route management lives
+#     on the node: `nodes list-routes` and
+#     `nodes approve-routes -i ID -r CIDR,CIDR`.
+#
+#   * The CLI marshals protobuf structs with encoding/json, so field names are
+#     snake_case (given_name, available_routes, pre_auth_key) and timestamps
+#     arrive as {"seconds":N,"nanos":N} objects, not RFC3339 strings. ts_iso()
+#     in the jq preamble normalises both spellings.
+#
+# ---------------------------------------------------------------------------
+# SECURITY
+# ---------------------------------------------------------------------------
+#
+#   Preauth keys are credentials. They are emitted ONLY in the JSON printed on
+#   stdout to the caller. They are never echoed to stderr, never written to a
+#   file, never passed as an argument to anything but headscale itself, and
+#   never routed through the /srv/jobs runner, whose logs are group-readable.
+#   Nothing in this script logs a key. Keep it that way.
+#
+# ---------------------------------------------------------------------------
+# ERROR PROPAGATION
+# ---------------------------------------------------------------------------
+#
+#   Helpers that can fail return their result in the global $R and return a
+#   non-zero status; they are NOT called inside $( ). A `die` inside a command
+#   substitution would print its JSON error into the *captured string* instead
+#   of stdout and the script would sail on with a corrupt body - which is
+#   exactly the class of bug this contract exists to prevent.
+#
+set -o pipefail
+umask 077
+
+PROG=${0##*/}
+R=            # result of the last R-returning helper
+HS_ERR=       # last headscale CLI diagnostic
+
+# --------------------------------------------------------------------------
+# Destination catalogue for this host (EDT1). The UI must never hardcode a
+# subnet; `hs-admin catalogue` hands it these and `--routes` accepts the ids.
+# --------------------------------------------------------------------------
+CAT_IDS=(lan static-edt lab tunnel)
+cat_cidr() {
+    case "$1" in
+        lan)        echo "192.168.2.0/24" ;;
+        static-edt) echo "172.15.4.0/24"  ;;
+        lab)        echo "172.16.4.0/24"  ;;
+        tunnel)     echo "172.16.0.0/24"  ;;
+        *)          return 1 ;;
+    esac
+}
+cat_desc() {
+    case "$1" in
+        lan)        echo "physical LAN behind bridge0" ;;
+        static-edt) echo "podman static network (br-static-edt)" ;;
+        lab)        echo "lab network, static addressing, services via edy-proxy-go" ;;
+        tunnel)     echo "the WireGuard tunnel subnet on this host (wg0)" ;;
+    esac
+}
+
+# --------------------------------------------------------------------------
+# plumbing
+# --------------------------------------------------------------------------
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+# Emit {"error": ...} on stdout so the plugin always parses a JSON body, put the
+# human text on stderr, and exit non-zero. Only ever called from the top-level
+# shell, never from inside $( ).
+die() {
+    local msg=$1 code=${2:-1}
+    warn "$msg"
+    if [[ -n ${JQ:-} ]]; then
+        "$JQ" -Mnc --arg e "$msg" --arg v "${VERB:-}" '{error:$e, verb:$v}'
+    else
+        printf '{"error":"%s"}\n' "${msg//\"/\'}"
+    fi
+    exit "$code"
+}
+
+JQ=$(command -v jq || true)
+[[ -n $JQ ]] || die "jq is required but not installed (apt install jq)" 3
+
+# jq preamble: timestamp + list normalisation, shared by every verb.
+JQPRE='
+def ts_iso:
+  if . == null then null
+  elif type == "object" then (if has("seconds") then (.seconds | tonumber | todate) else null end)
+  elif type == "number" then (. | todate)
+  else tostring end;
+def norm_list: if . == null then [] else . end;
+def uname_of: if . == null then null
+              elif type == "object" then (.name // .display_name // (.id | tostring))
+              else tostring end;
+'
+
+# -M is not optional. jq colourises when stdout is a tty, and this helper gets
+# run by hand from a terminal as often as it gets spawned by Cockpit. ANSI
+# escapes inside the body break JSON.parse and violate "JSON and nothing else".
+jqn() { "$JQ" -M -n "$@"; }
+
+# --------------------------------------------------------------------------
+# locate the binary, the config and the service unit
+# --------------------------------------------------------------------------
+find_bin() {
+    local c
+    if [[ -n ${HS_BIN:-} ]]; then
+        [[ -x $HS_BIN ]] || return 1
+        echo "$HS_BIN"; return 0
+    fi
+    # The snap's real binary first: no `snap run` confinement round-trip, and
+    # `current` is a stable symlink maintained across snap revisions.
+    for c in /snap/headscale/current/bin/headscale \
+             /usr/local/bin/headscale \
+             /usr/bin/headscale \
+             /snap/bin/headscale; do
+        [[ -x $c ]] && { echo "$c"; return 0; }
+    done
+    c=$(command -v headscale 2>/dev/null || true)
+    [[ -n $c ]] && { echo "$c"; return 0; }
+    return 1
+}
+
+find_cfg() {
+    local c
+    if [[ -n ${HS_CONFIG:-} ]]; then
+        [[ -r $HS_CONFIG ]] || return 1
+        echo "$HS_CONFIG"; return 0
+    fi
+    for c in /var/snap/headscale/common/config.yaml \
+             /etc/headscale/config.yaml \
+             /var/lib/headscale/config.yaml; do
+        [[ -r $c ]] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+find_unit() {
+    local u
+    for u in snap.headscale.headscaled.service headscale.service; do
+        if systemctl cat "$u" >/dev/null 2>&1; then echo "$u"; return 0; fi
+    done
+    return 1
+}
+
+HS_BIN_R=$(find_bin || true)
+HS_CFG_R=$(find_cfg || true)
+HS_UNIT=$(find_unit || true)
+
+# Read one TOP-LEVEL scalar out of the YAML config. Only column-0 keys match, so
+# a nested `path:` or `type:` deeper in the file cannot shadow a real answer.
+cfg_get() {
+    local key=$1
+    [[ -n $HS_CFG_R ]] || return 1
+    awk -v k="$key" '
+        $0 ~ "^" k "[ \t]*:" {
+            sub("^" k "[ \t]*:[ \t]*", "")
+            sub(/[ \t]*$/, "")
+            if ($0 !~ /^["'"'"']/) sub(/[ \t]+#.*$/, "")
+            gsub(/^["'"'"']|["'"'"']$/, "")
+            print
+            exit
+        }' "$HS_CFG_R"
+}
+
+# Nested scalar under a named top-level block (e.g. dns: -> base_domain:).
+cfg_get_under() {
+    local blk=$1 key=$2
+    [[ -n $HS_CFG_R ]] || return 1
+    awk -v b="$blk" -v k="$key" '
+        $0 ~ "^" b "[ \t]*:" { inb=1; next }
+        inb && /^[^ \t#]/ { inb=0 }
+        inb && $0 ~ "^[ \t]+" k "[ \t]*:" {
+            sub("^[ \t]+" k "[ \t]*:[ \t]*", "")
+            sub(/[ \t]*$/, "")
+            if ($0 !~ /^["'"'"']/) sub(/[ \t]+#.*$/, "")
+            gsub(/^["'"'"']|["'"'"']$/, "")
+            print
+            exit
+        }' "$HS_CFG_R"
+}
+
+server_url() {
+    local u; u=$(cfg_get server_url || true)
+    echo "${u%/}"
+}
+
+need_root() {
+    [[ $(id -u) -eq 0 ]] || die "must run as root: the headscale control socket lives in a 0700 root-owned directory" 4
+}
+need_hs() {
+    [[ -n $HS_BIN_R ]] || die "headscale binary not found (looked in /snap/headscale/current/bin, /usr/local/bin, /usr/bin, /snap/bin, PATH)" 3
+    [[ -n $HS_CFG_R ]] || die "headscale config not found (looked in /var/snap/headscale/common, /etc/headscale, /var/lib/headscale)" 3
+}
+
+# --------------------------------------------------------------------------
+# headscale CLI wrappers.  R-returning: never call these inside $( ).
+# --------------------------------------------------------------------------
+
+# hs_json SUBCOMMAND ... -> R = raw JSON body. rc 0 ok, 5 on CLI failure.
+hs_json() {
+    local err out rc
+    err=$(mktemp) || { warn "mktemp failed"; HS_ERR="mktemp failed"; return 3; }
+    out=$("$HS_BIN_R" -c "$HS_CFG_R" "$@" -o json 2>"$err"); rc=$?
+    # The CLI's own log noise belongs on stderr, per the contract.
+    cat "$err" >&2
+    if (( rc != 0 )); then
+        HS_ERR=$(grep -m1 -iE 'error|not set|not found' "$err" 2>/dev/null | head -c 300)
+        [[ -n $HS_ERR ]] || HS_ERR="rc=$rc, no diagnostic on stderr"
+        rm -f "$err"
+        return 5
+    fi
+    rm -f "$err"
+    HS_ERR=
+    R=$out
+    return 0
+}
+
+# hs_run SUBCOMMAND ... -> mutation with no JSON we care about. rc 0 / 5.
+hs_run() {
+    local err rc
+    err=$(mktemp) || { HS_ERR="mktemp failed"; return 3; }
+    "$HS_BIN_R" -c "$HS_CFG_R" "$@" >/dev/null 2>"$err"; rc=$?
+    cat "$err" >&2
+    if (( rc != 0 )); then
+        HS_ERR=$(grep -m1 -iE 'error|not set|not found' "$err" 2>/dev/null | head -c 300)
+        [[ -n $HS_ERR ]] || HS_ERR="rc=$rc"
+        rm -f "$err"; return 5
+    fi
+    rm -f "$err"; HS_ERR=; return 0
+}
+
+# THE null TRAP. Fold headscale's nil-slice `null` into an empty array. Cannot
+# fail, so it is safe inside $( ).
+norm_list() {
+    local body=$1
+    [[ -z ${body//[[:space:]]/} ]] && { echo '[]'; return 0; }
+    "$JQ" -c "$JQPRE norm_list" <<<"$body" 2>/dev/null || echo '[]'
+}
+
+# Unwrap {"user": {...}} / {"pre_auth_key": {...}} if the CLI ever wraps the
+# object; pass a bare object straight through. Safe inside $( ).
+unwrap() {
+    local body=$1 key=$2 out
+    out=$("$JQ" -c --arg k "$key" 'if type=="object" and has($k) then .[$k] else . end' <<<"$body" 2>/dev/null)
+    [[ -n $out ]] && echo "$out" || echo "$body"
+}
+
+# R = normalised users array
+users_json() { hs_json users list || return 5; R=$(norm_list "$R"); }
+# R = normalised nodes array
+nodes_json() { hs_json nodes list || return 5; R=$(norm_list "$R"); }
+
+# resolve_user NAME -> R = numeric id ("" if unknown). rc 5 if the list failed.
+resolve_user() {
+    local name=$1 body
+    users_json || return 5
+    body=$R
+    R=$("$JQ" -r --arg n "$name" '
+        (map(select(((.name // "") == $n) or ((.display_name // "") == $n) or ((.id|tostring) == $n)))
+         | first | .id? // empty) | tostring' <<<"$body")
+    return 0
+}
+
+# resolve_node REF -> R = "id<TAB>name" ("" if unknown). Accepts id, name or
+# given_name.
+resolve_node() {
+    local ref=$1 body
+    nodes_json || return 5
+    body=$R
+    R=$("$JQ" -r --arg n "$ref" '
+        (map(select(((.id|tostring) == $n) or ((.name // "") == $n) or ((.given_name // "") == $n)))
+         | first) as $m
+        | if $m == null then empty
+          else "\($m.id)\t\($m.given_name // $m.name // ("node-" + ($m.id|tostring)))"
+          end' <<<"$body")
+    return 0
+}
+
+valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._@-]{0,62}$ ]]; }
+
+# resolve_routes SPEC -> R = comma-separated CIDR list. Accepts catalogue ids
+# and literal CIDRs. rc 2 on a bad token.
+resolve_routes() {
+    local spec=$1 tok cidr out=() o
+    local oldifs=$IFS
+    IFS=','; set -- $spec; IFS=$oldifs
+    for tok in "$@"; do
+        tok=${tok// /}
+        [[ -z $tok ]] && continue
+        if cidr=$(cat_cidr "$tok"); then
+            out+=("$cidr")
+        elif [[ $tok =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]; then
+            out+=("$tok")
+        elif [[ $tok =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]]; then
+            out+=("$tok")
+        else
+            warn "unknown route token '$tok'"
+            return 2
+        fi
+    done
+    (( ${#out[@]} )) || { warn "route spec resolved to nothing"; return 2; }
+    o=$(IFS=','; echo "${out[*]}")
+    R=$o
+    return 0
+}
+
+# norm_expiration SPEC -> R = a duration Go's time.ParseDuration accepts.
+# A bare integer means DAYS. Go has no 'd' unit, so days are converted to hours
+# rather than gambling on the parser.
+norm_expiration() {
+    local e=$1
+    if [[ $e =~ ^[0-9]+$ ]]; then
+        R="$(( e * 24 ))h"
+    elif [[ $e =~ ^[0-9]+d$ ]]; then
+        R="$(( ${e%d} * 24 ))h"
+    elif [[ $e =~ ^[0-9]+(\.[0-9]+)?(s|m|h)$ ]]; then
+        R="$e"
+    else
+        warn "bad --expiration '$e'"
+        return 2
+    fi
+    return 0
+}
+
+# mint_key NAME REUSABLE EPHEMERAL EXPIRATION -> R = PreAuthKey JSON object.
+# The key value lives in $R and in the final stdout JSON. Nowhere else.
+mint_key() {
+    local name=$1 reusable=$2 ephemeral=$3 expiration=$4 uid args
+    resolve_user "$name" || return 5
+    uid=$R
+    [[ -n $uid && $uid != null ]] || { HS_ERR="no such user"; return 2; }
+
+    args=(preauthkeys create --user "$uid")
+    [[ $reusable  == true ]] && args+=(--reusable)
+    [[ $ephemeral == true ]] && args+=(--ephemeral)
+    args+=(--expiration "$expiration")
+
+    hs_json "${args[@]}" || return 5
+    R=$(unwrap "$R" pre_auth_key)
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# verbs
+# --------------------------------------------------------------------------
+
+v_catalogue() {
+    local rows='[]' id
+    for id in "${CAT_IDS[@]}"; do
+        rows=$("$JQ" -c --arg id "$id" --arg cidr "$(cat_cidr "$id")" --arg d "$(cat_desc "$id")" \
+              '. + [{id:$id, cidr:$cidr, description:$d}]' <<<"$rows")
+    done
+    jqn --argjson n "$rows" --arg su "$(server_url)" '{networks:$n, server_url:$su}'
+}
+
+v_status() {
+    local installed=false running=false api_ok=false version="" vsrc="" unit=${HS_UNIT:-}
+    [[ -n $HS_BIN_R && -n $HS_CFG_R ]] && installed=true
+    [[ -n $unit ]] && systemctl is-active --quiet "$unit" && running=true
+
+    # The snap manifest carries the real upstream version. The binary in this
+    # snap reports "dev" for `headscale version`, which is useless in a UI.
+    if [[ -r /snap/headscale/current/meta/snap.yaml ]]; then
+        version=$(awk -F': *' '/^version:/{print $2; exit}' /snap/headscale/current/meta/snap.yaml)
+        [[ -n $version ]] && vsrc="snap"
+    fi
+    if [[ -z $version && -n $HS_BIN_R ]]; then
+        version=$("$HS_BIN_R" version 2>/dev/null | head -1)
+        vsrc="binary"
+    fi
+    [[ -n $version ]] || { version="unknown"; vsrc="none"; }
+
+    # Real health probe: can we actually talk to the control socket? This is the
+    # only check that separates "the unit is active" from "the API answers".
+    if [[ $installed == true && $(id -u) -eq 0 ]]; then
+        "$HS_BIN_R" -c "$HS_CFG_R" users list -o json >/dev/null 2>&1 && api_ok=true
+    fi
+
+    jqn \
+        --argjson installed "$installed" \
+        --argjson running "$running" \
+        --argjson api_ok "$api_ok" \
+        --arg version "$version" \
+        --arg version_source "$vsrc" \
+        --arg listen_addr "$(cfg_get listen_addr || true)" \
+        --arg server_url  "$(server_url)" \
+        --arg metrics_listen_addr "$(cfg_get metrics_listen_addr || true)" \
+        --arg grpc_listen_addr    "$(cfg_get grpc_listen_addr || true)" \
+        --arg socket  "$(cfg_get unix_socket || true)" \
+        --arg config  "${HS_CFG_R:-}" \
+        --arg bin     "${HS_BIN_R:-}" \
+        --arg service "$unit" \
+        --arg base_domain "$(cfg_get_under dns base_domain || true)" \
+        '{installed:$installed, running:$running, version:$version,
+          listen_addr:$listen_addr, server_url:$server_url,
+          api_ok:$api_ok, version_source:$version_source,
+          metrics_listen_addr:$metrics_listen_addr, grpc_listen_addr:$grpc_listen_addr,
+          socket:$socket, config:$config, bin:$bin, service:$service,
+          base_domain:$base_domain}'
+}
+
+v_users() {
+    need_root; need_hs
+    users_json || die "headscale users list failed: $HS_ERR" 5
+    jqn --argjson u "$R" "$JQPRE"'
+        {users: ($u | map(. + {created_at: (.created_at | ts_iso)})), count: ($u|length)}'
+}
+
+v_nodes() {
+    need_root; need_hs
+    nodes_json || die "headscale nodes list failed: $HS_ERR" 5
+    # `user` may be a bare string or a nested User object depending on version;
+    # every boolean is `omitempty`, so absent means false, not unknown.
+    jqn --argjson n "$R" "$JQPRE"'
+        {nodes: ($n | map(. + {
+            user:             (.user              | uname_of),
+            last_seen:        (.last_seen         | ts_iso),
+            expiry:           (.expiry            | ts_iso),
+            created_at:       (.created_at        | ts_iso),
+            online:           (.online              // false),
+            key_expiry_disabled: (.key_expiry_disabled // false),
+            available_routes: (.available_routes  | norm_list),
+            approved_routes:  (.approved_routes   | norm_list),
+            subnet_routes:    (.subnet_routes     | norm_list),
+            ip_addresses:     (.ip_addresses      | norm_list),
+            valid_tags:       (.valid_tags        | norm_list),
+            forced_tags:      (.forced_tags       | norm_list)
+         })),
+         count: ($n|length)}'
+}
+
+v_new_user() {
+    need_root; need_hs
+    local name=${1:-} existing all
+    [[ -n $name ]] || die "usage: $PROG new-user NAME" 2
+    valid_name "$name" || die "invalid user name '$name' (letters, digits, . _ @ - ; max 63 chars)" 2
+
+    # Idempotent and re-runnable, like every wg-admin mutation.
+    resolve_user "$name" || die "headscale users list failed: $HS_ERR" 5
+    existing=$R
+    if [[ -n $existing && $existing != null ]]; then
+        warn "user '$name' already exists (id $existing), nothing to do"
+        users_json || die "headscale users list failed: $HS_ERR" 5
+        all=$R
+        jqn --argjson all "$all" --arg n "$name" "$JQPRE"'
+            {ok:true, created:false,
+             user: ($all | map(select((.name // "") == $n)) | first
+                    | . + {created_at: (.created_at | ts_iso)})}'
+        return $?
+    fi
+
+    hs_json users create "$name" || die "headscale users create '$name' failed: $HS_ERR" 5
+    R=$(unwrap "$R" user)
+    jqn --argjson u "$R" "$JQPRE"'
+        {ok:true, created:true, user: ($u + {created_at: ($u.created_at | ts_iso)})}'
+}
+
+v_del_user() {
+    need_root; need_hs
+    local name=${1:-} id
+    [[ -n $name ]] || die "usage: $PROG del-user NAME" 2
+    resolve_user "$name" || die "headscale users list failed: $HS_ERR" 5
+    id=$R
+    if [[ -z $id || $id == null ]]; then
+        warn "user '$name' does not exist, nothing to do"
+        jqn --arg n "$name" '{ok:true, deleted:false, user:$n}'
+        return $?
+    fi
+    if ! hs_run users destroy --identifier "$id" --force; then
+        hs_run users destroy --name "$name" --force \
+            || die "failed to destroy user '$name' (id $id): $HS_ERR" 5
+    fi
+    jqn --arg n "$name" --argjson id "$id" '{ok:true, deleted:true, user:$n, id:$id}'
+}
+
+v_new_key() {
+    need_root; need_hs
+    local name="" reusable=false ephemeral=false expiration="24h"
+    while (( $# )); do
+        case $1 in
+            --reusable)   reusable=true; shift ;;
+            --ephemeral)  ephemeral=true; shift ;;
+            --expiration) [[ -n ${2:-} ]] || die "--expiration needs a value" 2
+                          norm_expiration "$2" || die "--expiration must be a number of DAYS, or a duration like 30m / 24h / 7d (got '$2')" 2
+                          expiration=$R; shift 2 ;;
+            --*)          die "unknown flag for new-key: $1" 2 ;;
+            *)            [[ -z $name ]] || die "new-key takes exactly one USER" 2
+                          name=$1; shift ;;
+        esac
+    done
+    [[ -n $name ]] || die "usage: $PROG new-key USER [--reusable] [--ephemeral] [--expiration DAYS|30m|24h|7d]" 2
+
+    mint_key "$name" "$reusable" "$ephemeral" "$expiration"
+    case $? in
+        0) ;;
+        2) die "no such headscale user: '$name' (create it with: $PROG new-user $name)" 2 ;;
+        *) die "headscale preauthkeys create failed for '$name': $HS_ERR" 5 ;;
+    esac
+
+    jqn --argjson k "$R" --arg u "$name" "$JQPRE"'
+        {key: $k.key, user: $u, expires: ($k.expiration | ts_iso),
+         reusable: ($k.reusable // false), ephemeral: ($k.ephemeral // false),
+         id: ($k.id // null), used: ($k.used // false)}'
+}
+
+v_keys() {
+    need_root; need_hs
+    local name=${1:-} uid
+    [[ -n $name ]] || die "usage: $PROG keys USER" 2
+    resolve_user "$name" || die "headscale users list failed: $HS_ERR" 5
+    uid=$R
+    [[ -n $uid && $uid != null ]] || die "no such headscale user: '$name'" 2
+    # `preauthkeys list` REQUIRES --user and it wants the numeric ID.
+    hs_json preauthkeys list --user "$uid" || die "headscale preauthkeys list failed: $HS_ERR" 5
+    R=$(norm_list "$R")
+    # protoc-gen-go tags every field `omitempty`, so a FALSE boolean is simply
+    # absent from the JSON. Defaulting to false, not null, is what a UI needs.
+    jqn --argjson k "$R" --arg u "$name" "$JQPRE"'
+        {user:$u, keys: ($k | map({id: (.id // null),
+                                   key: (.key // null),
+                                   reusable:  (.reusable  // false),
+                                   ephemeral: (.ephemeral // false),
+                                   used:      (.used      // false),
+                                   expires:    (.expiration | ts_iso),
+                                   created_at: (.created_at | ts_iso)}))}'
+}
+
+# --------------------------------------------------------------------------
+# client-config: the point of the whole tool.
+# --------------------------------------------------------------------------
+NOTES='[]'
+add_note() { NOTES=$("$JQ" -c --arg s "$1" '. + [$s]' <<<"$NOTES"); }
+
+v_client_config() {
+    need_root; need_hs
+    local name="" os="" reusable=false ephemeral=false expiration="24h" adv="" hostname=""
+    local url key key_json expires advflag="" hostflag="" install join bd listen
+
+    while (( $# )); do
+        case $1 in
+            --os)          [[ -n ${2:-} ]] || die "--os needs a value" 2; os=$2; shift 2 ;;
+            --reusable)    reusable=true; shift ;;
+            --ephemeral)   ephemeral=true; shift ;;
+            --expiration)  [[ -n ${2:-} ]] || die "--expiration needs a value" 2
+                           norm_expiration "$2" || die "--expiration must be a number of DAYS, or a duration like 30m / 24h / 7d (got '$2')" 2
+                           expiration=$R; shift 2 ;;
+            --advertise-routes)
+                           [[ -n ${2:-} ]] || die "--advertise-routes needs a value" 2
+                           resolve_routes "$2" || die "bad --advertise-routes '$2' (catalogue ids: ${CAT_IDS[*]}, or literal CIDRs)" 2
+                           adv=$R; shift 2 ;;
+            --hostname)    [[ -n ${2:-} ]] || die "--hostname needs a value" 2; hostname=$2; shift 2 ;;
+            --*)           die "unknown flag for client-config: $1" 2 ;;
+            *)             [[ -z $name ]] || die "client-config takes exactly one USER" 2
+                           name=$1; shift ;;
+        esac
+    done
+    [[ -n $name ]] || die "usage: $PROG client-config USER --os linux|windows|macos [--advertise-routes a,b] [--reusable] [--ephemeral] [--expiration D] [--hostname H]" 2
+    case $os in
+        linux|windows|macos) ;;
+        "") die "--os is required (linux, windows or macos)" 2 ;;
+        *)  die "unsupported --os '$os' (linux, windows, macos)" 2 ;;
+    esac
+
+    url=$(server_url)
+    [[ -n $url ]] || die "server_url is not set in ${HS_CFG_R}; the client would have nothing to point at" 5
+    listen=$(cfg_get listen_addr || true)
+
+    mint_key "$name" "$reusable" "$ephemeral" "$expiration"
+    case $? in
+        0) ;;
+        2) die "no such headscale user: '$name' (create it with: $PROG new-user $name)" 2 ;;
+        *) die "headscale preauthkeys create failed for '$name': $HS_ERR" 5 ;;
+    esac
+    key_json=$R
+    key=$("$JQ" -r '.key // empty' <<<"$key_json")
+    [[ -n $key ]] || die "headscale returned a preauth key with no 'key' field for user '$name'" 5
+    expires=$("$JQ" -r "$JQPRE"'(.expiration | ts_iso) // "unknown"' <<<"$key_json")
+
+    [[ -n $adv ]]      && advflag=" --advertise-routes=$adv"
+    [[ -n $hostname ]] && hostflag=" --hostname=$hostname"
+
+    case $os in
+    linux)
+        join="sudo tailscale up --login-server ${url} --authkey ${key} --accept-routes${advflag}${hostflag}"
+        install=$(cat <<EOF
+# --- Tailscale client for headscale @ ${url} ---------------------------------
+# 1. Install the official Tailscale package (handles Debian/Ubuntu/RHEL/Arch)
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# 2. Make sure the daemon is running
+sudo systemctl enable --now tailscaled
+
+# 3. Join this headscale server
+${join}
+
+# 4. Verify
+tailscale status
+tailscale netcheck
+ip route show table all | grep -i tailscale
+EOF
+)
+        if [[ -n $adv ]]; then
+            install+=$(cat <<EOF
+
+
+# 5. THIS MACHINE IS A SUBNET ROUTER (--advertise-routes was requested).
+#    IP forwarding must be on, or it advertises routes and forwards nothing:
+printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' | sudo tee /etc/sysctl.d/99-tailscale.conf
+sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
+
+# 6. Then APPROVE the routes on the server - they are inert until you do:
+#      hs-admin approve-routes <NODE>
+EOF
+)
+        fi
+        ;;
+    windows)
+        join="tailscale up --login-server ${url} --authkey ${key} --accept-routes --unattended${advflag}${hostflag}"
+        install=$(cat <<EOF
+# --- Tailscale client for headscale @ ${url} ---------------------------------
+# Run these in an ELEVATED PowerShell (Run as Administrator).
+
+# 1. Install Tailscale
+winget install --exact --id tailscale.tailscale --accept-package-agreements --accept-source-agreements
+#    (or download the MSI: https://tailscale.com/download/windows)
+
+# 2. Pin the control server so the tray app never wanders back to tailscale.com.
+#    Not needed for the CLI join below, but required if anyone uses the GUI.
+reg add "HKLM\\SOFTWARE\\Tailscale IPN" /v LoginURL /t REG_SZ /d "${url}" /f
+Restart-Service Tailscale
+
+# 3. Join this headscale server. The installer normally puts tailscale.exe on
+#    PATH; if a fresh shell disagrees, use the full path on the second line.
+${join}
+& "C:\\Program Files\\Tailscale\\tailscale.exe" up --login-server ${url} --authkey ${key} --accept-routes --unattended${advflag}${hostflag}
+
+# 4. Verify
+tailscale status
+EOF
+)
+        if [[ -n $adv ]]; then
+            install+=$(cat <<'EOF'
+
+
+# 5. THIS MACHINE IS A SUBNET ROUTER (--advertise-routes was requested).
+#    Windows subnet routers need IP routing enabled in the registry:
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v IPEnableRouter /t REG_DWORD /d 1 /f
+Restart-Computer
+
+# 6. Then APPROVE the routes on the server - they are inert until you do:
+#      hs-admin approve-routes <NODE>
+EOF
+)
+        fi
+        ;;
+    macos)
+        join="sudo tailscale up --login-server ${url} --authkey ${key} --accept-routes${advflag}${hostflag}"
+        install=$(cat <<EOF
+# --- Tailscale client for headscale @ ${url} ---------------------------------
+# Option A - CLI only, via Homebrew. Simplest thing that works with headscale.
+brew install tailscale
+sudo brew services start tailscale
+${join}
+
+# Option B - the GUI app. It will not talk to a custom control server until
+# ControlURL is set, so set it FIRST, then restart the app, then log in.
+#   Mac App Store build:
+defaults write io.tailscale.ipn.macos ControlURL ${url}
+#   Standalone (tailscale.com download) build:
+defaults write io.tailscale.ipn.macsys ControlURL ${url}
+#   Quit and reopen Tailscale.app, then "Log in". Or drive the bundled CLI with
+#   the key already minted above:
+/Applications/Tailscale.app/Contents/MacOS/Tailscale up --login-server ${url} --authkey ${key} --accept-routes${advflag}${hostflag}
+
+# Option C - install the configuration profile this headscale serves:
+#   inspect it first, then open ${url}/apple in a browser and follow it
+curl ${url}/apple/macos-app-store
+curl ${url}/apple/macos-standalone
+
+# Verify
+tailscale status
+EOF
+)
+        ;;
+    esac
+
+    # ----- notes: the part that stops "connected but nothing routes" ---------
+    NOTES='[]'
+    add_note "--accept-routes (already in the join command above) is about RECEIVING. It tells THIS machine to install the subnet routes that OTHER nodes advertise. Without it the client comes up, pings 100.64.x.x tailnet addresses fine, and cannot reach a single LAN behind any subnet router. That is the number one cause of 'connected but nothing routes'."
+    add_note "--advertise-routes=CIDR,CIDR is about OFFERING. It tells the tailnet that THIS machine can gateway its own local subnets. You only need it on a machine that is meant to BE a subnet router. On an ordinary laptop it does nothing useful; missing from a gateway, nobody can reach anything behind that gateway."
+    add_note "The two are not symmetric and are not interchangeable. The gateway needs --advertise-routes; every client that wants to USE that gateway needs --accept-routes. Swap them and it fails silently, because the tunnel comes up either way and only the traffic you care about is missing."
+    add_note "Advertised routes are INERT until they are approved server-side. After the node joins, run: hs-admin approve-routes <NODE>. Until then 'headscale nodes list-routes' shows them as available but not approved and the traffic is dropped."
+    add_note "A subnet router also needs IP forwarding enabled (net.ipv4.ip_forward=1 on Linux). Routes approved plus forwarding off means packets reach the gateway and die there - which looks identical to a routing problem."
+    if [[ $reusable == true ]]; then
+        add_note "This preauth key is REUSABLE: any number of machines can join with it until ${expires}. Treat it as a shared credential and expire it when the rollout is done (headscale preauthkeys expire)."
+    else
+        add_note "This preauth key is SINGLE-USE: the first machine that joins consumes it. Mint another with 'hs-admin new-key ${name}' for a second machine. It expires at ${expires}."
+    fi
+    if [[ $ephemeral == true ]]; then
+        add_note "This key is EPHEMERAL: headscale removes the node automatically once it goes offline. Do not use an ephemeral key for a subnet router - its approved routes disappear with it."
+    fi
+    add_note "Control server is ${url}, bound to ${listen}. On EDT1 that address lives on the virbr-edy libvirt bridge, so a client can only finish the join if it can actually reach ${url} - from the edy-lab VM network, across the WireGuard tunnel, or through a reverse proxy. Check first with: curl -s ${url}/health"
+    case $os in
+      linux)   add_note "On Linux --accept-routes is OFF by default, which is why it is spelled out in the join command. Windows and macOS accept routes by default; the flag is passed on every platform anyway so the same command is correct everywhere." ;;
+      windows) add_note "Windows accepts subnet routes by default; the flag is included so the command matches every other platform. --unattended keeps the tunnel up when no user is logged in - drop it on a personal laptop, keep it on a server or kiosk." ;;
+      macos)   add_note "macOS accepts subnet routes by default; the flag is included so the command matches every other platform. Note the Mac App Store build is sandboxed and cannot act as a subnet router - use the standalone or Homebrew build if this machine must advertise routes." ;;
+    esac
+    if [[ -n $adv ]]; then
+        add_note "This config advertises ${adv}. Run 'hs-admin approve-routes <NODE>' after the node appears in 'hs-admin nodes', and make sure no other node already advertises an overlapping range - headscale will happily approve two gateways for the same subnet and the clients pick one arbitrarily."
+    fi
+    bd=$(cfg_get_under dns base_domain || true)
+    if [[ $bd == "example.com" ]]; then
+        add_note "MagicDNS is on but dns.base_domain is still the stock 'example.com', so clients get names like host.example.com that collide with real public DNS. Set dns.base_domain in ${HS_CFG_R} to something you control before rolling clients out widely."
+    fi
+
+    jqn \
+        --arg install "$install" \
+        --arg join "$join" \
+        --argjson notes "$NOTES" \
+        --arg os "$os" \
+        --arg user "$name" \
+        --arg login_server "$url" \
+        --arg key_expires "$expires" \
+        --argjson reusable "$reusable" \
+        --argjson ephemeral "$ephemeral" \
+        --arg adv "$adv" \
+        '{install:$install, join:$join, notes:$notes,
+          os:$os, user:$user, login_server:$login_server,
+          key_expires:$key_expires, reusable:$reusable, ephemeral:$ephemeral,
+          advertise_routes: (if $adv == "" then [] else ($adv | split(",")) end)}'
+}
+
+v_advertise() {
+    need_hs
+    local name="" routes="" csv url cmd
+    while (( $# )); do
+        case $1 in
+            --routes) [[ -n ${2:-} ]] || die "--routes needs a value" 2; routes=$2; shift 2 ;;
+            --*)      die "unknown flag for advertise: $1" 2 ;;
+            *)        [[ -z $name ]] || die "advertise takes exactly one USER" 2; name=$1; shift ;;
+        esac
+    done
+    [[ -n $name ]]   || die "usage: $PROG advertise USER --routes CIDR,CIDR (catalogue ids also accepted: ${CAT_IDS[*]})" 2
+    [[ -n $routes ]] || die "--routes is required" 2
+    resolve_routes "$routes" || die "bad --routes '$routes' (catalogue ids: ${CAT_IDS[*]}, or literal CIDRs)" 2
+    csv=$R
+    url=$(server_url)
+
+    cmd="sudo tailscale up --login-server ${url} --advertise-routes=${csv} --accept-routes"
+    jqn --arg cmd "$cmd" --arg u "$name" --arg csv "$csv" --arg url "$url" '
+        {command:$cmd, user:$u, routes:($csv|split(",")), login_server:$url,
+         sysctl:["net.ipv4.ip_forward = 1","net.ipv6.conf.all.forwarding = 1"],
+         notes:[
+           "Run this ON THE CLIENT that owns those subnets, not on the headscale server. Re-running `tailscale up` on an already-joined node just changes its settings - no preauth key is needed for a node that has already registered.",
+           "--advertise-routes OFFERS these subnets to the tailnet. It does not let this machine reach anybody else\u0027s subnets; that is --accept-routes, which is included above so the gateway is also a full participant rather than a one-way door.",
+           "Advertising is only half the job. The routes stay inert until they are approved on the server: hs-admin approve-routes <NODE>.",
+           "Apply the sysctl values above (write them into /etc/sysctl.d/99-tailscale.conf and run sysctl -p) or the gateway will accept packets and forward none of them.",
+           "Tailscale masquerades subnet-route traffic by default (--snat-subnet-routes=true). Turn it off only if the target subnet already has a route back to 100.64.0.0/10, otherwise replies have nowhere to go."
+         ]}'
+}
+
+v_approve_routes() {
+    need_root; need_hs
+    local ref="" want="" resolved id nodename csv after
+    while (( $# )); do
+        case $1 in
+            --routes) [[ -n ${2:-} ]] || die "--routes needs a value" 2; want=$2; shift 2 ;;
+            --*)      die "unknown flag for approve-routes: $1" 2 ;;
+            *)        [[ -z $ref ]] || die "approve-routes takes exactly one NODE" 2; ref=$1; shift ;;
+        esac
+    done
+    [[ -n $ref ]] || die "usage: $PROG approve-routes NODE [--routes CIDR,CIDR]" 2
+
+    resolve_node "$ref" || die "headscale nodes list failed: $HS_ERR" 5
+    resolved=$R
+    [[ -n $resolved ]] || die "no such node: '$ref' (run '$PROG nodes' for ids and names)" 2
+    id=${resolved%%$'\t'*}
+    nodename=${resolved##*$'\t'}
+
+    if [[ -n $want ]]; then
+        resolve_routes "$want" || die "bad --routes '$want' (catalogue ids: ${CAT_IDS[*]}, or literal CIDRs)" 2
+        csv=$R
+    else
+        # Default: approve exactly what the node currently advertises, keeping
+        # anything already approved so this verb is idempotent and additive.
+        nodes_json || die "headscale nodes list failed: $HS_ERR" 5
+        csv=$("$JQ" -r --arg i "$id" "$JQPRE"'
+            map(select((.id|tostring) == $i)) | first
+            | ((.available_routes | norm_list) + (.approved_routes | norm_list))
+            | unique | join(",")' <<<"$R")
+    fi
+
+    if [[ -z $csv || $csv == "null" ]]; then
+        warn "node '$nodename' (id $id) advertises no routes; nothing to approve"
+        jqn --arg n "$nodename" --argjson id "$id" \
+            '{ok:true, node:$n, id:$id, approved:[], changed:false,
+              note:"node advertises no routes - run `tailscale up --advertise-routes=...` on the node itself first"}'
+        return $?
+    fi
+
+    hs_run nodes approve-routes --identifier "$id" --routes "$csv" \
+        || die "approve-routes failed for node '$nodename' (id $id), routes '$csv': $HS_ERR" 5
+
+    # Read the state back rather than trusting the write.
+    nodes_json || die "headscale nodes list failed: $HS_ERR" 5
+    after=$("$JQ" -c --arg i "$id" "$JQPRE"'
+        map(select((.id|tostring) == $i)) | first | (.approved_routes | norm_list)' <<<"$R")
+    [[ -n $after ]] || after='[]'
+    jqn --arg n "$nodename" --argjson id "$id" --argjson a "$after" \
+        '{ok:true, node:$n, id:$id, approved:$a, changed:true}'
+}
+
+v_usage() {
+    cat >&2 <<EOF
+$PROG - narrow root helper for the Cockpit headscale plugin. JSON on stdout.
+
+  $PROG status
+  $PROG catalogue
+  $PROG users
+  $PROG nodes
+  $PROG keys USER
+  $PROG new-user NAME
+  $PROG del-user NAME
+  $PROG new-key USER [--reusable] [--ephemeral] [--expiration DAYS|30m|24h|7d]
+  $PROG client-config USER --os linux|windows|macos
+                           [--reusable] [--ephemeral] [--expiration D]
+                           [--advertise-routes a,b] [--hostname H]
+  $PROG advertise USER --routes CIDR,CIDR
+  $PROG approve-routes NODE [--routes CIDR,CIDR]
+
+--routes / --advertise-routes accept catalogue ids as well as literal CIDRs:
+  ${CAT_IDS[*]}
+EOF
+    jqn --arg e "no verb given (see stderr for usage)" '{error:$e}'
+    exit 2
+}
+
+VERB=${1:-}
+[[ -n $VERB ]] || v_usage
+shift || true
+
+case $VERB in
+    status)          v_status "$@" ;;
+    catalogue)       v_catalogue "$@" ;;
+    users)           v_users "$@" ;;
+    nodes)           v_nodes "$@" ;;
+    keys)            v_keys "$@" ;;
+    new-user)        v_new_user "$@" ;;
+    del-user)        v_del_user "$@" ;;
+    new-key)         v_new_key "$@" ;;
+    client-config)   v_client_config "$@" ;;
+    advertise)       v_advertise "$@" ;;
+    approve-routes)  v_approve_routes "$@" ;;
+    -h|--help|help)  v_usage ;;
+    *)               die "unknown verb '$VERB' (run: $PROG --help)" 2 ;;
+esac

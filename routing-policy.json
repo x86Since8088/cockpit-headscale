@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "tag": "cockpit-hs",
+  "note": [
+    "Stored routing policy for the headscale subnet router on this host.",
+    "",
+    "This is deliberately NARROWER than cockpit-wireguard's routing-policy.json,",
+    "because headscale already owns most of what that file has to declare:",
+    "  - WHICH prefixes may be routed is decided by route approval, held in",
+    "    headscale's database and declared in acl-policy.hujson autoApprovers.",
+    "  - The FORWARD/MASQUERADE rules for approved subnets are programmed by",
+    "    tailscaled into its own ts-* chains. Do not write those rules here.",
+    "",
+    "What is left is the host state tailscaled does NOT manage and that nothing",
+    "restores if it disappears:",
+    "  1. Forwarding sysctls. tailscaled WARNS when ip_forward is off and then",
+    "     carries on; it never sets or re-asserts them. An exit node advertising",
+    "     ::/0 with IPv6 forwarding off fails only for v6, which presents as",
+    "     'some sites hang', not as an outage.",
+    "  2. The jump from the built-in FORWARD chain into ts-forward, and its",
+    "     ORDER. A podman/libvirt/docker restart or any iptables-restore strips",
+    "     the jump; the ts-* chains survive intact and are simply never reached.",
+    "     Worse, if LIBVIRT_FWI ends up ahead of ts-forward, the libvirt networks",
+    "     (172.20.10.0/24 and 192.168.122.0/24) are REJECTed for tailnet clients",
+    "     while every other route keeps working.",
+    "  3. The advertised set itself. `tailscale up` is NOT additive: a later bare",
+    "     `tailscale up` drops --advertise-routes and --advertise-exit-node, and",
+    "     the node silently stops serving while still showing online.",
+    "",
+    "Keep advertise_routes in step with acl-policy.hujson autoApprovers.routes -",
+    "a prefix advertised but not auto-approved needs a manual approve-routes call,",
+    "and that call REPLACES the node's whole approved set."
+  ],
+
+  "sysctl": {
+    "net.ipv4.ip_forward": "1",
+    "net.ipv6.conf.all.forwarding": "1"
+  },
+
+  "control_server": "https://192.168.2.14:8085",
+
+  "router": {
+    "hostname": "edt1-router",
+    "advertise_exit_node": true,
+    "accept_dns": false,
+    "note": "accept_dns is false on purpose: edt1 runs its own resolver, and letting the tailnet push MagicDNS over the host would hijack DNS for every service on it.",
+    "advertise_routes": [
+      "192.168.2.0/24",
+      "172.16.4.0/24",
+      "172.15.4.0/24",
+      "172.20.10.0/24",
+      "172.30.10.0/24",
+      "10.90.0.0/24",
+      "10.88.0.0/16",
+      "192.168.122.0/24"
+    ]
+  },
+
+  "chain_order": {
+    "must_precede": [
+      { "jump": "ts-forward", "before": "LIBVIRT_FWI", "chain": "FORWARD" }
+    ]
+  }
+}

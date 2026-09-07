@@ -229,3 +229,61 @@ All text meets WCAG AA contrast in both themes (measured worst case 4.97:1).
 ## Licence
 
 BSD-3-Clause, matching headscale and the upstream plugin.
+
+---
+
+## Subnet-router policy and reconciler (`--with-policy`)
+
+The Cockpit panel manages headscale's own object model. It does **not** touch
+host networking, and deliberately so — but a headscale *subnet router* depends on
+host state that neither headscale nor tailscaled will restore if it disappears.
+These files cover that gap.
+
+| File | Purpose |
+|---|---|
+| `acl-policy.hujson` | ACL policy. `autoApprovers` is the declarative form of route approval. |
+| `routing-policy.json` | The host state a subnet router needs: forwarding sysctls, the advertised set, required chain ordering. |
+| `hs-policy` | `check` / `apply` / `status` reconciler. |
+| `hs-policy-watch.service` | Runs `hs-policy apply` every 30s. |
+
+Install with `sudo ./install.sh --with-policy`, then
+`systemctl enable --now hs-policy-watch.service`.
+
+### Why this is narrower than the WireGuard equivalent
+
+`cockpit-wireguard` needs a full stored routing policy because WireGuard has no
+concept of one — which subnets a client may reach exists only as iptables rules.
+Headscale already owns that: route approval lives in its database, and
+`autoApprovers` declares it. It also owns the forwarding and NAT rules, which
+tailscaled programs into its own `ts-*` chains. **Do not write those rules here.**
+
+What is left is genuinely unmanaged:
+
+1. **Forwarding sysctls.** `tailscaled` warns once at `tailscale up` that
+   forwarding is off, then carries on forever. Nothing re-asserts them. An exit
+   node advertising `::/0` with IPv6 forwarding off fails *only* for IPv6, which
+   presents as "some sites hang", not as an outage.
+2. **The jump from `FORWARD` into `ts-forward`, and its order.** A podman,
+   libvirt or docker restart strips the jump. The `ts-*` chains survive intact
+   and are simply never reached — so the rules look perfectly correct while
+   nothing routes. If `LIBVIRT_FWI` ends up ahead of `ts-forward`, the libvirt
+   networks are REJECTed for tailnet clients while every other route keeps
+   working. Verified on this host: deleting the jump breaks routing, and the
+   watcher restores it within ~55s by restarting tailscaled.
+3. **The advertised set.** `tailscale up` is **not additive** — a later bare
+   `tailscale up` drops `--advertise-routes` and `--advertise-exit-node`, and the
+   node stops serving while still reporting online.
+
+### Two things it will not do
+
+**It never calls `headscale nodes approve-routes`.** That command *replaces* a
+node's entire approved set, so a reconciler could revoke routes it was never told
+about. Approval belongs in `autoApprovers`, which is declarative and safe.
+
+**It never runs `tailscale up` unattended.** An earlier version did, and it was a
+genuine hazard: `tailscale up` is not additive and may need an auth key, so
+running it automatically can log the node out — causing the outage the tool
+exists to prevent. Worse, when tailscaled is mid-restart `tailscale debug prefs`
+returns nothing, so *every* route reads as missing and the "repair" fires against
+a healthy node. Route drift is now reported with the exact command to run by
+hand, and an unavailable prefs read is reported as `unknown`, never as drift.

@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+#
+# hs-policy - reconcile the host state a headscale SUBNET ROUTER needs but that
+#             neither headscale nor tailscaled will restore on its own.
+#
+#   hs-policy check    report drift; exit 1 if the live state does not match
+#   hs-policy apply    fix what is fixable (idempotent)
+#   hs-policy status   JSON summary, for the Cockpit panel
+#
+# SCOPE — deliberately narrow, and narrower than wg-policy
+#   headscale already owns the two things wg-policy had to invent:
+#     * WHICH prefixes may be routed  -> route approval + acl autoApprovers
+#     * the FORWARD/MASQUERADE rules  -> tailscaled's own ts-* chains
+#   Writing either of those here would fight the tools that own them. What is
+#   left is host state that silently disappears:
+#
+#     1. Forwarding sysctls. tailscaled warns once at `tailscale up` and then
+#        carries on forever. Nothing re-asserts them.
+#     2. The FORWARD -> ts-forward jump, and its ORDER relative to LIBVIRT_FWI.
+#        The ts-* chains survive a container-engine restart; the JUMP INTO them
+#        does not. The chains then look perfectly correct and are never reached
+#        -- the same class of failure as an appended-instead-of-inserted rule.
+#     3. The advertised set. `tailscale up` is not additive, so a later bare
+#        `tailscale up` drops --advertise-routes/--advertise-exit-node and the
+#        node stops serving while still reporting online.
+#
+# WHAT IT WILL NOT DO
+#   It never calls `headscale nodes approve-routes`. That command REPLACES a
+#   node's entire approved set, so a well-meaning reconciler could revoke routes
+#   it was never told about. Approval belongs in acl-policy.hujson autoApprovers,
+#   which is declarative and additive-safe. Drift in approval is REPORTED here,
+#   never silently "corrected".
+
+set -Eeuo pipefail
+
+POLICY="${HS_POLICY_FILE:-/etc/headscale/routing-policy.json}"
+TS="${TAILSCALE_BIN:-tailscale}"
+
+die() { printf 'hs-policy: %s\n' "$*" >&2; exit 1; }
+
+[[ -r "$POLICY" ]] || die "policy file not readable: $POLICY"
+command -v jq >/dev/null 2>&1 || die "jq is required"
+command -v "$TS" >/dev/null 2>&1 || die "tailscale not found (is this host a subnet router?)"
+
+# ---------------------------------------------------------------- sysctl drift
+sysctl_drift() {
+    local k want cur
+    while read -r k; do
+        want="$(jq -r --arg k "$k" '.sysctl[$k]' "$POLICY")"
+        cur="$(sysctl -n "$k" 2>/dev/null || echo '?')"
+        [[ "$cur" == "$want" ]] || printf '%s|%s|%s\n' "$k" "$want" "$cur"
+    done < <(jq -r '.sysctl|keys[]' "$POLICY")
+}
+
+# ------------------------------------------------------------- chain integrity
+# Returns the FORWARD line number of a jump target, or empty. -v is REQUIRED:
+# without it iptables -L omits the interface/target columns this greps for.
+chain_line() {
+    iptables -L FORWARD -v -n --line-numbers 2>/dev/null \
+        | awk -v t="$1" '$0 ~ t && $1 ~ /^[0-9]+$/ {print $1; exit}'
+}
+
+chain_drift() {
+    local jump before chain tsl bl
+    while IFS='|' read -r jump before chain; do
+        [[ -n "$jump" ]] || continue
+        tsl="$(chain_line "$jump")"
+        if [[ -z "$tsl" ]]; then
+            printf 'missing|%s|%s|the jump into %s is absent -- its chain still exists but nothing reaches it\n' \
+                "$jump" "$before" "$jump"
+            continue
+        fi
+        bl="$(chain_line "$before")"
+        if [[ -n "$bl" ]] && (( tsl > bl )); then
+            printf 'order|%s|%s|%s is at line %s, AFTER %s at line %s\n' \
+                "$jump" "$before" "$jump" "$tsl" "$before" "$bl"
+        fi
+    done < <(jq -r '.chain_order.must_precede[]? | "\(.jump)|\(.before)|\(.chain)"' "$POLICY")
+}
+
+# -------------------------------------------------------------- advertised set
+# What tailscaled is CURRENTLY advertising, sorted for comparison.
+# LC_ALL=C is REQUIRED on both sides. `comm` demands C collation, but the
+# default locale sorts "::/0" before "0.0.0.0/0" and "192.168.122.0/24" before
+# "192.168.2.0/24". Mixing the two makes comm emit spurious differences AND
+# print "file N is not in sorted order" to stderr - which reads as real drift
+# and made `status` disagree with `check`.
+live_routes() {
+    "$TS" debug prefs 2>/dev/null \
+        | jq -r '(.AdvertiseRoutes // [])[]' 2>/dev/null | LC_ALL=C sort -u
+}
+policy_routes() { jq -r '.router.advertise_routes[]' "$POLICY" | LC_ALL=C sort -u; }
+
+wants_exit_node() { [[ "$(jq -r '.router.advertise_exit_node' "$POLICY")" == "true" ]]; }
+has_exit_node() {
+    # the exit-node offer shows up as both halves of the default route
+    live_routes | grep -qx '0.0.0.0/0' && live_routes | grep -qx '::/0'
+}
+
+route_drift() {
+    local missing extra live
+    # If tailscaled is down or mid-restart, `debug prefs` returns nothing and
+    # EVERY policy route looks missing. Acting on that would be catastrophic:
+    # the tool would "repair" a healthy node by re-running tailscale up. Treat
+    # an empty/unavailable prefs read as UNKNOWN, never as drift.
+    live="$(live_routes)"
+    if ! logged_in || [[ -z "$live" ]]; then
+        printf 'unknown|tailscaled is not reporting prefs; route state cannot be evaluated\n'
+        return 0
+    fi
+    missing="$(LC_ALL=C comm -23 <(policy_routes) <(printf '%s\n' "$live") | tr '\n' ' ')"
+    extra="$(LC_ALL=C comm -13 <(policy_routes) <(printf '%s\n' "$live") | grep -vE '^(0\.0\.0\.0/0|::/0)$' | tr '\n' ' ')"
+    [[ -n "${missing// }" ]] && printf 'missing|%s\n' "$missing"
+    [[ -n "${extra// }"   ]] && printf 'extra|%s\n'   "$extra"
+    if wants_exit_node && ! has_exit_node; then
+        printf 'exitnode|policy wants an exit node but the node is not advertising both 0.0.0.0/0 and ::/0\n'
+    fi
+    return 0
+}
+
+logged_in() { "$TS" status --json 2>/dev/null | jq -e '.BackendState == "Running"' >/dev/null 2>&1; }
+
+# --------------------------------------------------------------------- reapply
+# Rebuild the exact `tailscale up` this policy describes. Used only when the
+# advertised set has drifted -- `tailscale up` is not additive, so it must carry
+# every flag every time.
+ts_up_args() {
+    local routes
+    routes="$(policy_routes | paste -sd, -)"
+    printf -- '--login-server=%s --advertise-routes=%s --hostname=%s --accept-dns=%s' \
+        "$(jq -r '.control_server' "$POLICY")" \
+        "$routes" \
+        "$(jq -r '.router.hostname' "$POLICY")" \
+        "$(jq -r '.router.accept_dns' "$POLICY")"
+    wants_exit_node && printf -- ' --advertise-exit-node'
+}
+
+cmd_check() {
+    local bad=0 k want cur kind a b msg
+    echo "policy: $POLICY"
+
+    if logged_in; then echo "  tailscale: logged in"
+    else echo "  TAILSCALE  not logged in to the control server"; bad=1; fi
+
+    while IFS='|' read -r k want cur; do
+        [[ -n "$k" ]] || continue
+        printf '  SYSCTL     %s is %s, policy wants %s\n' "$k" "$cur" "$want"; bad=1
+    done < <(sysctl_drift)
+
+    while IFS='|' read -r kind a b msg; do
+        [[ -n "$kind" ]] || continue
+        printf '  CHAIN      %s\n' "$msg"; bad=1
+    done < <(chain_drift)
+
+    while IFS='|' read -r kind msg; do
+        [[ -n "$kind" ]] || continue
+        case "$kind" in
+            missing)  printf '  ROUTES     not advertised: %s\n' "$msg"; bad=1 ;;
+            extra)    printf '  ROUTES     advertised but not in policy: %s\n' "$msg" ;;
+            exitnode) printf '  EXITNODE   %s\n' "$msg"; bad=1 ;;
+            unknown)  printf '  ROUTES     %s\n' "$msg" ;;
+        esac
+    done < <(route_drift)
+
+    (( bad == 0 )) && echo "  in sync"
+    return $bad
+}
+
+cmd_apply() {
+    local changed=0 k want cur kind a b msg
+    while IFS='|' read -r k want cur; do
+        [[ -n "$k" ]] || continue
+        sysctl -w "$k=$want" >/dev/null && printf '  + sysctl %s=%s (was %s)\n' "$k" "$want" "$cur"
+        changed=$((changed+1))
+    done < <(sysctl_drift)
+
+    # A missing or mis-ordered ts-forward jump is tailscaled's to own: poking
+    # its chains by hand would diverge from whatever it does next. Restarting it
+    # makes it reinstall and re-order its own hooks.
+    if [[ -n "$(chain_drift)" ]]; then
+        printf '  ! ts-forward jump is missing or ordered after LIBVIRT_FWI\n'
+        printf '    restarting tailscaled so it reinstalls its own hooks\n'
+        systemctl restart snap.tailscale.tailscaled 2>/dev/null \
+            || systemctl restart tailscaled 2>/dev/null \
+            || printf '    could not restart tailscaled\n'
+        sleep 3
+        changed=$((changed+1))
+    fi
+
+    # Route drift is REPORTED, never auto-corrected. `tailscale up` is not
+    # additive and may require an auth key: running it unattended can log the
+    # node out or drop flags - i.e. cause the exact outage this tool exists to
+    # prevent. Print the exact command and let an operator run it.
+    local rd; rd="$(route_drift)"
+    if [[ -n "$rd" ]] && ! grep -q '^unknown|' <<<"$rd"; then
+        printf '  ! advertised set has drifted -- NOT auto-corrected\n'
+        sed 's/^/      /' <<<"$rd"
+        printf '    run this by hand (it replaces the whole flag set):\n'
+        printf '      tailscale up %s\n' "$(ts_up_args)"
+    fi
+
+    printf '  reconciled: %d change(s)\n' "$changed"
+}
+
+cmd_status() {
+    local sd cd rd
+    sd="$(sysctl_drift | wc -l)"; cd="$(chain_drift | wc -l)"; rd="$(route_drift | wc -l)"
+    jq -n --argjson sysctl "$sd" --argjson chain "$cd" --argjson routes "$rd" \
+          --argjson login "$(logged_in && echo true || echo false)" \
+          --arg policy "$POLICY" \
+        '{ok:true,policy:$policy,logged_in:$login,
+          drift:{sysctl:$sysctl,chain:$chain,routes:$routes},
+          in_sync:($login and $sysctl==0 and $chain==0 and $routes==0)}'
+}
+
+case "${1:-}" in
+    check)  cmd_check ;;
+    apply)  cmd_apply ;;
+    status) cmd_status ;;
+    *) sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 2 ;;
+esac

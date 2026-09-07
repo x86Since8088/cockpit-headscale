@@ -101,3 +101,33 @@ cockpit.service is not required.
 
 The page appears in the Cockpit navigation as "Headscale".
 NOTE
+
+# --with-policy: install the subnet-router policy, its reconciler, the watch
+# unit and the ACL policy. These are HOST files, not Cockpit package files, and
+# the reconciler changes firewall/sysctl state - so they are opt-in rather than
+# part of a plain UI install.
+if [ "${WITH_POLICY:-0}" = "1" ] || [ "${1:-}" = "--with-policy" ]; then
+    SRCDIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+    for f in routing-policy.json hs-policy hs-policy-watch.service acl-policy.hujson; do
+        [ -f "$SRCDIR/$f" ] || { echo "install.sh: missing $SRCDIR/$f" >&2; exit 1; }
+    done
+    install -D -m 0644 "$SRCDIR/routing-policy.json"    "${DESTDIR:-}/etc/headscale/routing-policy.json"
+    install -D -m 0755 "$SRCDIR/hs-policy"              "${DESTDIR:-}/usr/local/sbin/hs-policy"
+    install -D -m 0644 "$SRCDIR/hs-policy-watch.service" "${DESTDIR:-}/etc/systemd/system/hs-policy-watch.service"
+    # The ACL policy goes to headscale's own writable area (the snap cannot read
+    # /etc). Never overwrite an existing one - it is operator-edited.
+    ACL="${DESTDIR:-}/var/snap/headscale/common/acl-policy.hujson"
+    if [ -e "$ACL" ]; then
+        echo "  ACL policy already present, left untouched: $ACL"
+    else
+        install -D -m 0644 "$SRCDIR/acl-policy.hujson" "$ACL"
+        echo "  installed ACL policy: $ACL"
+        echo "  point config.yaml policy.path at it, then restart headscale"
+    fi
+    echo "  installed subnet-router policy + reconciler"
+    if [ -z "${DESTDIR:-}" ]; then
+        systemctl daemon-reload
+        echo "  run: systemctl enable --now hs-policy-watch.service"
+        echo "  check drift any time with: hs-policy check"
+    fi
+fi

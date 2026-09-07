@@ -313,7 +313,21 @@
             for (var k in opts)
                 options[k] = opts[k];
         }
-        return cockpit.spawn(argv, options);
+        return cockpit.spawn(argv, options).catch(function (err) {
+            // superuser:"try" downgrades to unprivileged SILENTLY when it cannot
+            // escalate, and headscale's control socket lives in a 0700 root
+            // directory. Retry ONCE with "require" so Cockpit raises a real
+            // authentication prompt instead of an unexplained failure.
+            var v = classify(err);
+            if (options.superuser === "require" ||
+                (v.kind !== "channel" && v.kind !== "privilege"))
+                throw err;
+            var retry = {};
+            for (var k2 in options)
+                retry[k2] = options[k2];
+            retry.superuser = "require";
+            return cockpit.spawn(argv, retry);
+        });
     }
 
     function classify(err) {
@@ -335,6 +349,17 @@
 
         if (problem === "not-found")
             return { kind: "missing", msg: msg, problem: problem };
+
+        // Cockpit channel failures are NOT headscale output. Without this case
+        // they fell through to the generic branch and were rendered under a
+        // "Reported by headscale" heading, so a bare "Internal error" looked
+        // like the daemon had spoken when it had never been reached.
+        if (problem === "internal-error" || problem === "protocol-error" ||
+            problem === "terminated" || problem === "disconnected" ||
+            problem === "no-cockpit" || problem === "no-session")
+            return { kind: "channel", msg: msg, problem: problem,
+                     hint: "Cockpit could not run the command. This is a transport or " +
+                           "privilege-escalation failure, not a reply from headscale." };
 
         // headscale's own socket diagnostics
         if (low.indexOf("permission denied") !== -1)
@@ -1386,6 +1411,14 @@
             kind = "err";
             title = "headscale rejected its configuration";
             paragraphs.push("The service is reachable but headscale reported a configuration problem. The exact message is below.");
+        } else if (state.dataError && state.dataError.kind === "channel") {
+            kind = "err";
+            title = "Cockpit could not run the headscale command";
+            paragraphs.push("The service is running and healthy as far as this page can tell. What failed is the " +
+                "channel Cockpit uses to execute commands on this host \u2014 the request never reached headscale, " +
+                "so the message below is Cockpit's, not the daemon's.");
+            paragraphs.push("This is almost always privilege escalation: turn on \u201cAdministrative access\u201d " +
+                "in the Cockpit header and press Refresh. If it persists, reload the page to restart the bridge.");
         } else if (state.dataError) {
             kind = "err";
             title = "headscale could not be queried";
@@ -1406,7 +1439,9 @@
             state.dataError.kind !== "privilege" &&
             state.dataError.kind !== "missing") {
             append(banner, el("div", null,
-                el("div", { class: "hs-inline-note", text: "Reported by headscale:" }),
+                el("div", { class: "hs-inline-note",
+                    text: (state.dataError && state.dataError.kind === "channel")
+                        ? "Reported by Cockpit:" : "Reported by headscale:" }),
                 el("pre", { class: "hs-pre", text: state.dataError.msg })));
         }
 
@@ -1648,9 +1683,28 @@
      * removed and routes now live on the node object. This view reconstructs
      * the advertised-vs-approved picture from nodes list.
      */
+    /*
+     * 0.0.0.0/0 and ::/0 are NOT ordinary prefixes: approving them makes the
+     * node an EXIT NODE, carrying a client's entire traffic rather than one
+     * subnet. headscale reports the two halves as independent routes, so it is
+     * easy to approve v4 and forget v6 -- which does not fail cleanly, it
+     * presents as "some sites work and some hang" once a client selects the
+     * exit node. Detect them, label them, and warn on both counts.
+     */
+    var EXIT_V4 = "0.0.0.0/0";
+    var EXIT_V6 = "::/0";
+    function isExitRoute(cidr) { return cidr === EXIT_V4 || cidr === EXIT_V6; }
+    function exitHalves(approved) {
+        return {
+            v4: approved.indexOf(EXIT_V4) !== -1,
+            v6: approved.indexOf(EXIT_V6) !== -1
+        };
+    }
+
     function renderRoutes() {
         var nodes = state.nodes || [];
         var rows = [];
+        var exitWarnings = [];
 
         nodes.forEach(function (n) {
             var available = n.available_routes || [];
@@ -1665,6 +1719,15 @@
                     all.push(r);
             });
 
+            // A node offering an exit node with only one address family
+            // approved is a real misconfiguration, not a preference.
+            var halves = exitHalves(approved);
+            if (halves.v4 !== halves.v6) {
+                exitWarnings.push((n.given_name || n.name || ("node " + n.id)) +
+                    " has " + (halves.v4 ? EXIT_V4 : EXIT_V6) + " approved but not " +
+                    (halves.v4 ? EXIT_V6 : EXIT_V4));
+            }
+
             all.forEach(function (cidr) {
                 var isAdvertised = available.indexOf(cidr) !== -1;
                 var isApproved = approved.indexOf(cidr) !== -1;
@@ -1677,8 +1740,11 @@
                     btn = el("button", {
                         class: "hs-btn sm danger",
                         onclick: function () {
-                            approveRoutes(n, next, "Revoke route approval",
-                                "Stop routing " + cidr + " through " +
+                            approveRoutes(n, next, isExitRoute(cidr)
+                                    ? "Revoke exit-node route" : "Revoke route approval",
+                                (isExitRoute(cidr)
+                                    ? "Stop offering " + cidr + " as an EXIT NODE on "
+                                    : "Stop routing " + cidr + " through ") +
                                 (n.given_name || n.name) + "?", true);
                         },
                         text: "Revoke"
@@ -1688,16 +1754,27 @@
                     btn = el("button", {
                         class: "hs-btn sm",
                         onclick: function () {
-                            approveRoutes(n, next, "Approve route",
-                                "Allow " + (n.given_name || n.name) +
-                                " to route traffic for " + cidr + "?", false);
+                            approveRoutes(n, next, isExitRoute(cidr)
+                                    ? "Approve EXIT NODE route" : "Approve route",
+                                isExitRoute(cidr)
+                                    ? "Approving " + cidr + " makes " +
+                                      (n.given_name || n.name) + " an EXIT NODE: it will " +
+                                      "carry ALL traffic for any client that selects it, not " +
+                                      "just one subnet. Approve both " + EXIT_V4 + " and " +
+                                      EXIT_V6 + " or clients will only tunnel one address family."
+                                    : "Allow " + (n.given_name || n.name) +
+                                      " to route traffic for " + cidr + "?", false);
                         },
                         text: "Approve"
                     });
                 }
 
                 rows.push(el("tr", null,
-                    el("td", { class: "hs-mono" }, el("strong", { text: cidr })),
+                    el("td", { class: "hs-mono" },
+                        el("strong", { text: cidr }),
+                        isExitRoute(cidr)
+                            ? el("div", null, pill("warn", "exit node"))
+                            : null),
                     el("td", null,
                         el("span", { text: n.given_name || n.name || "—" }),
                         el("div", { class: "hs-inline-note", text: "node " + n.id })),
@@ -1723,8 +1800,17 @@
             el("p", { text: "Approving or revoking rewrites the node's entire approved set, because that is how " +
                 "headscale nodes approve-routes works — the confirmation dialog shows the exact resulting command." }));
 
+        var warnBanner = exitWarnings.length
+            ? el("div", { class: "hs-banner warn" },
+                el("h2", { text: "Exit node approved for only one address family" }),
+                el("p", { text: exitWarnings.join("; ") + ". A client selecting this exit " +
+                    "node will tunnel one address family and leak the other over its local " +
+                    "link. Approve both halves." }))
+            : null;
+
         return el("div", null,
             note,
+            warnBanner,
             card("Routes",
                 "Subnet routes and exit nodes advertised by registered nodes.",
                 table(["Prefix", "Node", "User", "Advertised", "Approved", "Serving", "Actions"],

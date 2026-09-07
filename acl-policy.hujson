@@ -1,0 +1,127 @@
+// headscale ACL policy for the edt1 tailnet.  HuJSON: comments and trailing
+// commas are allowed.
+//
+// WHY THIS FILE EXISTS AT ALL
+//   headscale's behaviour with NO policy loaded is ALLOW-ALL. That is strictly
+//   more permissive than the WireGuard setup this sits beside, where every
+//   destination is gated by an explicit FORWARD rule and an absent rule fails
+//   CLOSED. Adding a policy inverts that back: here, traffic not matched by a
+//   rule below is denied.
+//
+// THE autoApprovers BLOCK IS THE ROUTING POLICY
+//   This is the headscale analogue of cockpit-wireguard's routing-policy.json.
+//   A subnet router advertises with `tailscale up --advertise-routes=...`, but
+//   nothing is served until the prefix is APPROVED. Listing a prefix under
+//   autoApprovers.routes means a router carrying the right tag gets it approved
+//   automatically at registration, instead of an operator running
+//   `headscale nodes approve-routes` by hand.
+//
+//   That matters more than convenience: `approve-routes -r <list>` REPLACES a
+//   node's entire approved set (there is no additive form), so hand-approving
+//   "one more route" silently revokes the others. Declaring them here avoids
+//   ever making that call manually.
+//
+//   Keep this list in step with routing-policy.json - they describe the same
+//   networks for two different tunnels.
+
+{
+  // ---------------------------------------------------------------- ownership
+  // Who is allowed to apply a tag to a node. A tag used but not declared here
+  // is rejected at `headscale nodes tag` time.
+  // headscale 0.26 (policy v2) requires every user alias to contain "@". A
+  // local user with no email address is written "<name>@" - bare "eddie" is
+  // rejected at load time with "Invalid Owner", and headscale then refuses to
+  // start at all rather than running without a policy.
+  "groups": {
+    "group:admins": ["eddie@"],
+  },
+
+  "tagOwners": {
+    "tag:router":  ["group:admins"],  // subnet routers / exit nodes
+    "tag:server":  ["group:admins"],  // always-on lab services
+    "tag:client":  ["group:admins"],  // laptops, phones, workstations
+  },
+
+  // ------------------------------------------------------------------- hosts
+  // Named aliases so the ACL rules below read as intent rather than as CIDRs.
+  "hosts": {
+    "lan":             "192.168.2.0/24",
+    "lab":             "172.16.4.0/24",
+    "static-edt":      "172.15.4.0/24",
+    "edy-lab":         "172.20.10.0/24",
+    "podman-rproxy":   "172.30.10.0/24",
+    "podman-edy-dev":  "10.90.0.0/24",
+    "podman-default":  "10.88.0.0/16",
+    "libvirt-default": "192.168.122.0/24",
+  },
+
+  // ------------------------------------------------------- automatic approval
+  // The declarative form of route approval. A node tagged tag:router that
+  // advertises any of these gets it approved without operator action.
+  "autoApprovers": {
+    "routes": {
+      "192.168.2.0/24":   ["tag:router"],
+      "172.16.4.0/24":    ["tag:router"],
+      "172.15.4.0/24":    ["tag:router"],
+      "172.20.10.0/24":   ["tag:router"],
+      "172.30.10.0/24":   ["tag:router"],
+      "10.90.0.0/24":     ["tag:router"],
+      "10.88.0.0/16":     ["tag:router"],
+      "192.168.122.0/24": ["tag:router"],
+    },
+    // Exit nodes must approve BOTH halves of the default route. Approving only
+    // 0.0.0.0/0 leaves IPv6 unrouted, which presents as "some sites work".
+    "exitNode": ["tag:router"],
+  },
+
+  // -------------------------------------------------------------------- acls
+  // Default is DENY: anything not matched here is dropped by each client's own
+  // packet filter. Note this enforcement is distributed into the clients - no
+  // host-side tool can inspect or repair it, unlike an iptables FORWARD rule.
+  "acls": [
+    // The operator's own devices reach the whole lab.
+    {
+      "action": "accept",
+      "src":    ["group:admins"],
+      "dst": [
+        "lan:*",
+        "lab:*",
+        "static-edt:*",
+        "edy-lab:*",
+        "podman-rproxy:*",
+        "podman-edy-dev:*",
+        "podman-default:*",
+        "libvirt-default:*",
+      ],
+    },
+
+    // Tailnet-internal: the operator's devices can reach each other on any port
+    // (needed for MagicDNS names to be useful at all).
+    {
+      "action": "accept",
+      "src":    ["group:admins"],
+      "dst":    ["group:admins:*"],
+    },
+
+    // Tagged servers are reachable on the ports they actually serve, rather
+    // than wide open.
+    {
+      "action": "accept",
+      "src":    ["group:admins"],
+      "dst":    ["tag:server:22,80,443,3389,8085,9090"],
+    },
+
+    // Subnet routers must be reachable for the routes they carry.
+    {
+      "action": "accept",
+      "src":    ["group:admins"],
+      "dst":    ["tag:router:*"],
+    },
+  ],
+
+  // ------------------------------------------------------------------- ssh
+  // Tailscale SSH. Left empty deliberately: enabling it would let the control
+  // plane grant shell access, which is a bigger change than this policy should
+  // make on its own.
+  "ssh": [],
+}

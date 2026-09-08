@@ -1,0 +1,60 @@
+# hs-policy-watch.service.in - TEMPLATE. install.sh renders this; nothing
+# installs the .in file itself.
+#
+# HOW A UNIT FINDS THE INSTALL PATH  (DEPLOY-CONTRACT.md section 6.2)
+#
+#   It does not search and it carries no literal. install.sh substitutes the
+#   at-sign tokens below with paths it resolved for itself, then REFUSES to write
+#   the unit if any token survives. Note for whoever edits this comment: that
+#   grep runs over the rendered file, comments included, and cannot tell prose
+#   from a missed substitution - so do not write an unsubstituted token here.
+#
+#   The executable directory is its own token rather than a hardcoded "bin/",
+#   because a deployed payload keeps helpers in bin/ and a dev checkout keeps
+#   them at the repository root. That is the one asymmetry the contract tolerates
+#   and this is the only place a unit has to know about it.
+#
+# WHO CREATES AND STARTS IT  (section 6.1)
+#
+#   install.sh renders and places this file and runs `systemctl daemon-reload`.
+#   It NEVER enables, starts, restarts or stops it, and in a dev install it
+#   refuses to render it at all without --with-units - two reconcilers rewriting
+#   one host's forward rules from two different policy files is a confusing
+#   outage nobody should be able to cause by running an installer from a
+#   checkout. deploy.sh enables it, and only behind --with-policy.
+
+[Unit]
+Description=Reconcile headscale subnet-router host state against the stored policy
+Documentation=file:@ENV_FILE@
+# tailscaled must be up first: hs-policy reads its prefs and inspects the ts-*
+# chains it installs, and would otherwise report every route as missing on boot.
+After=network-online.target snap.tailscale.tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Not EnvironmentFile=- : this reconciler changes sysctl and firewall state, and
+# one running with compiled-in defaults it was never configured with is worse
+# than one that refuses to start. hs-policy reads the same file itself, through
+# install.conf; the line is here so a missing .env fails visibly in
+# `systemctl status` rather than at the first reconcile.
+EnvironmentFile=@ENV_FILE@
+
+# The loop lives here rather than in a timer so the interval is visible in the
+# unit and the unit's own journal carries the reconcile history. The interval
+# comes from the deployed .env, so changing it is an edit to one file plus a
+# restart, not an edit to a unit.
+ExecStart=/bin/sh -c 'while :; do @BIN@/hs-policy apply; sleep "${HS_POLICY_INTERVAL:-30}"; done'
+Restart=always
+RestartSec=10
+
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run /proc/sys/net
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

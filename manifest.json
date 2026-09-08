@@ -3,6 +3,9 @@
     "requires": {
         "cockpit": "266"
     },
+    "conditions": [
+        {"path-exists": "/usr/local/sbin/hs-admin"}
+    ],
     "menu": {
         "index": {
             "label": "Headscale",

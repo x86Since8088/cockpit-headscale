@@ -1,0 +1,90 @@
+# cockpit-headscale .envdefault
+#
+# Seeded to [install path]/.env by deploy.sh, MISSING-ONLY - an existing .env is
+# never overwritten. See cockpit-secrets/source/docs/DEPLOY-CONTRACT.md section 4.
+#
+# Grammar, strictly: KEY=value, KEY="value with spaces", KEY= (empty). Keys match
+# ^[A-Z][A-Z0-9_]*$. No `export`. No $, no ${...}, no $(...), no backticks -
+# there is NO interpolation, because this one file is parsed by sh, by python and
+# by systemd's EnvironmentFile= and only a subset of all three is safe. Full-line
+# comments only; a trailing # is part of the value.
+#
+# LOCATIONS AND SETTINGS ONLY. NEVER A SECRET. Preauth keys and API keys are
+# credentials; they are minted by headscale, returned to the caller once, and
+# never written here or anywhere else by this project.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS FILE MATTERS MORE HERE THAN ANYWHERE ELSE IN THE TREE
+# ---------------------------------------------------------------------------
+# headscale is packaged by NO distribution. There is no /usr/bin/headscale that
+# a package manager put there and no canonical config path. Whoever installed it
+# chose - a snap, a tarball into /usr/local/bin, a container - and that choice is
+# not discoverable, only recorded. Every other project in this tree can fall back
+# on a distribution's layout; this one cannot, which is exactly the situation a
+# deployed .env exists for.
+#
+# The Cockpit page does not read this file. It asks `hs-admin status`, which
+# does. That is deliberate: a page that carried its own candidate list would be a
+# second copy of this decision, and the two would drift.
+
+# --------------------------------------------------------------- headscale
+
+# The headscale binary. Absolute path to a real executable.
+#
+# The value below is this host's: the Canonical snap. Note it is NOT
+# /snap/bin/headscale - that is a shim symlinked to /usr/bin/snap, and going
+# through it costs a `snap run` confinement round-trip on every call. `current`
+# is a stable symlink the snap maintains across revisions, so this path survives
+# a snap refresh.
+#
+# Wrong or empty: hs-admin reports "headscale binary not found" and every verb
+# fails with that message. The page then shows a checklist row naming this key
+# rather than an empty screen.
+HEADSCALE_BIN=/snap/headscale/current/bin/headscale
+
+# headscale's config.yaml. It MUST be passed explicitly on every invocation: the
+# binary's compiled-in default is /etc/headscale/config.yaml, which does not
+# exist under the snap, and the snap injects HEADSCALE_CONFIG into its own
+# wrapper environment only - not into a call to the real binary.
+HEADSCALE_CONFIG=/var/snap/headscale/common/config.yaml
+
+# The systemd unit, when there is one. The Canonical snap names its service
+# "headscaled", not "headscale", and other packagings differ. Leave EMPTY to let
+# hs-admin probe the usual names; set it when the unit has a name nothing would
+# guess.
+HEADSCALE_UNIT=snap.headscale.headscaled.service
+
+# The gRPC control socket. Leave EMPTY - the normal case - and hs-admin reads
+# `unix_socket:` out of HEADSCALE_CONFIG, so there is one source of truth. Set it
+# only when the config does not name one. Note the socket sits in a
+# drwx------ root root directory, so EVERY query needs root, including a
+# read-only list; that is why this plugin has a root helper at all.
+HEADSCALE_SOCKET=
+
+# ------------------------------------------------- the subnet-router policy
+
+# The stored policy: the sysctl settings and forward rules a headscale SUBNET
+# ROUTER needs and that neither headscale nor tailscaled restores on its own.
+# install.sh seeds this path from etcdefaults/routing-policy.json, missing-only -
+# it is operator-edited content, so a re-install never overwrites it.
+HS_POLICY_FILE=/etc/headscale/routing-policy.json
+
+# The ACL policy headscale itself loads, in HuJSON. Its autoApprovers stanza is
+# where route approval belongs: declarative and additive-safe, unlike
+# `nodes approve-routes`, which REPLACES a node's whole approved set and would
+# silently revoke a route it was never told about.
+#
+# Under the snap this must be inside the snap's own writable area - confinement
+# means the daemon cannot read /etc. Point config.yaml's policy.path at it and
+# restart headscale after the first seed.
+HS_ACL_POLICY_FILE=/var/snap/headscale/common/acl-policy.hujson
+
+# Seconds between reconcile ticks in hs-policy-watch. Reconciling costs a few
+# reads; the thing it guards against - a container engine restart stripping the
+# jump into ts-forward - leaves the node online and serving nothing, so checking
+# often is far cheaper than missing it.
+HS_POLICY_INTERVAL=30
+
+# The tailscale client binary hs-policy inspects on a subnet router. A bare name
+# is resolved on PATH; give an absolute path if it is not on the daemon's.
+TAILSCALE_BIN=tailscale

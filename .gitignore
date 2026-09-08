@@ -2,3 +2,11 @@ __pycache__/
 *.pyc
 node_modules/
 test-results/
+
+# The DEV .env, and it is TESTS ONLY. A deployed plugin never reads this file -
+# it reads [install path]/.env, which deploy.sh seeds from .envdefault and which
+# hs-admin and hs-policy find through /etc/cockpit-headscale/install.conf.
+# Committing one would put a host's settings in a public repo and would give a
+# dev install a way to look like a deployed one.
+.env
+!.envdefault

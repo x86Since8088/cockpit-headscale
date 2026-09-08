@@ -97,6 +97,25 @@
      * Constants
      * ------------------------------------------------------------------ */
 
+    // The project's own root helper, and the FIRST place this page asks where
+    // headscale lives.
+    //
+    // It is one top-of-file literal constant holding an absolute path, and it
+    // has to be: install.sh's completeness gate greps the shipped page files for
+    // /usr/local/sbin/<name> literals and refuses the install if HELPERS does
+    // not carry every hit. A path assembled at runtime, or held in state that a
+    // later spawn reads, is invisible to that grep and defeats the gate. This
+    // is also the defect the gate exists for - hs-admin was installed on the
+    // host by hand and mentioned zero times by this project's installer.
+    var HS_ADMIN = "/usr/local/sbin/hs-admin";
+
+    // FALLBACK ONLY, and deliberately kept. The headscale binary is packaged by
+    // no distribution, so where it lives is an operator decision - which is
+    // exactly what the deployed .env records, and what hs-admin reads and
+    // reports back through `hs-admin status`. These lists are what this page
+    // guesses when hs-admin is not installed, so that a half-installed host
+    // still renders a diagnosis rather than an empty screen.
+    //
     // Snap first: on this class of host headscale is normally the Canonical
     // snap, whose shim lives in /snap/bin. Cockpit's bridge does not usually
     // have /snap/bin on PATH, so absolute paths are required.
@@ -144,6 +163,8 @@
 
         bin: null,          // resolved absolute path to the headscale binary
         binSearched: false,
+        locatedBy: null,    // "hs-admin" (from the deployed .env) or "search"
+        adminMissing: false, // hs-admin is not installed; every path below is a guess
         isSnap: false,
         version: null,      // best-effort version string
         versionNote: null,  // caveat about where the version came from
@@ -400,7 +421,58 @@
      * Probes
      * ------------------------------------------------------------------ */
 
+    // ASK THE HELPER FIRST. hs-admin resolves the binary, the config and the
+    // control socket from the deployed .env (via /etc/cockpit-headscale/
+    // install.conf), which is the one place an operator records where they put
+    // an unpackaged binary. Only if the helper is absent does this page fall
+    // back to guessing from the candidate lists above.
+    //
+    // This is the "a page that must spawn a path from configuration takes that
+    // value from .env via the helper" rule, made real: state.bin is not a
+    // literal the completeness gate could check, so it must not come from a
+    // literal at all - it comes from the helper that reads the configuration.
+    function probeLocations() {
+        return cockpit.spawn([HS_ADMIN, "status"],
+                             { superuser: "require", err: "message" })
+            .then(function (out) {
+                var st = JSON.parse(String(out || "{}").trim() || "{}");
+                if (st.error)
+                    throw new Error(st.error);
+                state.locatedBy = "hs-admin";
+                state.adminMissing = false;
+                if (st.bin) {
+                    state.bin = st.bin;
+                    state.binSearched = true;
+                    state.isSnap = st.bin.indexOf("/snap/") === 0;
+                }
+                if (st.config) state.configPath = st.config;
+                if (st.socket) state.socketPath = st.socket;
+                if (st.service) state.unit = st.service;
+                if (st.version && st.version !== "unknown") {
+                    state.version = st.version;
+                    state.versionNote = st.version_source === "snap"
+                        ? "Reported by the snap manifest; the binary itself reports \u201cdev\u201d."
+                        : null;
+                }
+            })
+            .catch(function (err) {
+                // Not fatal, and not silent: the checklist says so, names the
+                // file and names the .env key, rather than the page simply
+                // looking like headscale is missing.
+                state.locatedBy = "search";
+                state.adminMissing = true;
+                state.partial.push({
+                    what: "hs-admin",
+                    detail: classify(err).msg + " \u2014 falling back to searching " +
+                            "the built-in candidate paths, which are a guess."
+                });
+            });
+    }
+
     function probeBinary() {
+        // Already answered authoritatively by hs-admin.
+        if (state.bin && state.locatedBy === "hs-admin")
+            return Promise.resolve();
         // One shell round-trip instead of four channels.
         var script = 'for p in ' + BIN_CANDIDATES.join(" ") + '; do ' +
                      'if [ -x "$p" ]; then echo "$p"; exit 0; fi; done; ' +
@@ -472,6 +544,10 @@
     }
 
     function probeConfig() {
+        // hs-admin already read this out of the deployed .env, including the
+        // control socket it names.
+        if (state.configPath && state.locatedBy === "hs-admin")
+            return Promise.resolve();
         var script = 'for p in ' + CONFIG_CANDIDATES.join(" ") + '; do ' +
                      'if [ -f "$p" ]; then echo "$p"; exit 0; fi; done';
         return cockpit.spawn(["/bin/sh", "-c", script], { err: "message" })
@@ -670,7 +746,8 @@
         state.partial = [];
         render();
 
-        return probeBinary()
+        return probeLocations()
+            .then(probeBinary)
             .then(function () {
                 return Promise.all([probeUnit(), probeConfig(), probeVersion()]);
             })
@@ -1310,11 +1387,30 @@
     function renderChecklist() {
         var items = [];
 
+        // Where the paths on this checklist came from. A page that cannot say
+        // whether it was told or guessed is a page that cannot be debugged.
+        if (state.adminMissing) {
+            items.push(checkItem("warn", "Helper",
+                el("span", null, el("code", { class: "hs-code", text: HS_ADMIN }), " not available"),
+                "Everything below was GUESSED from built-in candidate paths. Install this " +
+                "project (deploy.sh, then install.sh) so the helper exists, and record where " +
+                "headscale actually lives in HEADSCALE_BIN / HEADSCALE_CONFIG in the deployed " +
+                ".env named by /etc/cockpit-headscale/install.conf."));
+        } else if (state.locatedBy === "hs-admin") {
+            items.push(checkItem("ok", "Helper",
+                el("code", { class: "hs-code", text: HS_ADMIN }),
+                "The paths below come from the deployed configuration, not from a search."));
+        }
+
         items.push(state.bin
             ? checkItem("ok", "Binary", el("code", { class: "hs-code", text: state.bin }),
                 state.isSnap ? "Provided by a snap package." : null)
             : checkItem("bad", "Binary", "not found",
-                "Looked in " + BIN_CANDIDATES.join(", ") + " and on $PATH."));
+                state.adminMissing
+                    ? "Looked in " + BIN_CANDIDATES.join(", ") + " and on $PATH. headscale is " +
+                      "packaged by no distribution, so a search is not expected to find a " +
+                      "hand-installed one - set HEADSCALE_BIN in the deployed .env."
+                    : "HEADSCALE_BIN in the deployed .env does not name an executable file."));
 
         if (state.version)
             items.push(checkItem("ok", "Version", state.version, state.versionNote));

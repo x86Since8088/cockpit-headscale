@@ -33,10 +33,69 @@
 
 set -Eeuo pipefail
 
-POLICY="${HS_POLICY_FILE:-/etc/headscale/routing-policy.json}"
-TS="${TAILSCALE_BIN:-tailscale}"
-
 die() { printf 'hs-policy: %s\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------- deployed configuration --
+# DEPLOY-CONTRACT.md sections 4.1/4.3. Resolution order, and there is no step 4:
+#   1. $HS_POLICY_ENV - non-root only, owner-checked. TESTS ONLY. An environment
+#      variable that redirects a ROOT process's configuration is a privilege
+#      escalation, whether or not the file holds a secret.
+#   2. ENV_FILE= out of /etc/cockpit-headscale/install.conf, written by
+#      install.sh. The normal path, and the only one on a production host.
+#   3. Fail, naming install.conf.
+# No "look beside me" step: this file is reached through a symlink into the
+# payload, and resolving .env relative to itself would read the dev checkout's
+# test .env on a dev install.
+INSTALL_CONF="/etc/cockpit-headscale/install.conf"
+declare -A CFG=()
+
+cfg_parse() {
+    local file=$1 n=0 line k v
+    [[ -r $file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z $line || ${line:0:1} == "#" ]] && continue
+        [[ $line == *=* ]] || { printf 'hs-policy: %s:%d: not KEY=VALUE\n' "$file" "$n" >&2; return 1; }
+        k=${line%%=*}; v=${line#*=}
+        k=${k%"${k##*[![:space:]]}"}
+        v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+        [[ $k =~ ^[A-Z][A-Z0-9_]*$ ]] || { printf 'hs-policy: %s:%d: bad key %s\n' "$file" "$n" "$k" >&2; return 1; }
+        [[ ${#v} -ge 2 && ${v:0:1} == '"' && ${v: -1} == '"' ]] && v=${v:1:-1}
+        case $v in *'$'*|*'`'*) printf 'hs-policy: %s:%d: %s contains $ or ` - no interpolation\n' "$file" "$n" "$k" >&2; return 1 ;; esac
+        CFG["$k"]=$v
+    done < "$file"
+    return 0
+}
+
+CFG_ERROR=""
+cfg_load() {
+    local envfile="" conf_env
+    if [[ -n ${HS_POLICY_ENV:-} ]]; then
+        if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+            printf 'hs-policy: ignoring HS_POLICY_ENV - a root helper is configured by %s only\n' "$INSTALL_CONF" >&2
+        elif [[ -O ${HS_POLICY_ENV} && -r ${HS_POLICY_ENV} ]]; then
+            envfile=${HS_POLICY_ENV}
+        else
+            printf 'hs-policy: ignoring HS_POLICY_ENV - not a readable file you own\n' >&2
+        fi
+    fi
+    if [[ -z $envfile ]]; then
+        cfg_parse "$INSTALL_CONF" || { CFG_ERROR="no usable $INSTALL_CONF - run install.sh"; return 1; }
+        conf_env=${CFG[ENV_FILE]:-}
+        CFG=()
+        [[ -n $conf_env ]] || { CFG_ERROR="$INSTALL_CONF does not set ENV_FILE - re-run install.sh"; return 1; }
+        envfile=$conf_env
+    fi
+    cfg_parse "$envfile" || { CFG_ERROR="could not read $envfile"; return 1; }
+    return 0
+}
+
+cfg_load || die "$CFG_ERROR"
+
+POLICY="${CFG[HS_POLICY_FILE]:-}"
+[[ -n "$POLICY" ]] || die "HS_POLICY_FILE is not set in the deployed .env"
+TS="${CFG[TAILSCALE_BIN]:-tailscale}"
 
 [[ -r "$POLICY" ]] || die "policy file not readable: $POLICY"
 command -v jq >/dev/null 2>&1 || die "jq is required"

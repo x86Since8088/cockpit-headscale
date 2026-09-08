@@ -72,31 +72,206 @@ These are design constraints, not incidental behaviour.
   and why.
 
 
-## Install
+## Install and deploy
+
+There are **two** processes and they are not the same thing.
+
+| | `install.sh` | `deploy.sh` |
+|---|---|---|
+| What it is | An in-place install **by symlink**, from wherever it is run | The real deployment: a copy, then config, then `install.sh` |
+| Moves bytes? | **No.** It links; it never copies the payload | Yes. It is the only thing that copies |
+| Where it runs from | The payload — dev checkout *or* install path | The dev checkout |
+| Owns `.env`? | No. Reads it, refuses without it | Yes. Seeds it from `.envdefault`, **missing-only** |
+| Owns units? | Renders and places. Never enables or starts | Enables and starts, behind `--with-policy` |
+
+The one idea: **the script is the same; only where it is run from differs.**
+
+### Deploy (the normal case)
 
 ```sh
-sudo ./install.sh                # -> /usr/share/cockpit/headscale
-./install.sh --user              # -> ~/.local/share/cockpit/headscale
+sudo ./deploy.sh                      # -> /opt/cockpit-headscale
+sudo ./deploy.sh --install-to /srv/x  # somewhere else
+sudo ./deploy.sh --with-policy        # ...and enable the subnet-router reconciler
+sudo ./deploy.sh --verify             # standing checks only, change nothing
+sudo ./deploy.sh --uninstall          # remove links and units, keep the tree
+sudo ./deploy.sh --remove             # remove the deployed tree too
+```
+
+That produces:
+
+```
+/opt/cockpit-headscale/payload -> payload-1.1.0/     bin/hs-admin, index.html, ...
+/opt/cockpit-headscale/.env                          your settings   0644 root:root
+/etc/cockpit-headscale/install.conf                  what install.sh did
+/usr/share/cockpit/headscale/*  -> payload/*         per-file symlinks
+/usr/local/sbin/{hs-admin,hs-policy} -> payload/bin/*
+/etc/systemd/system/hs-policy-watch.service          rendered from systemd/*.in
+```
+
+**Unmount the share and all of that keeps working.** That is the acceptance
+test, and `install.sh` asserts it after every deployed install: no symlink and
+no unit may resolve into the dev tree. headscale itself is never touched — not
+its binary, not its config, not its database, not its unit.
+
+### Dev install (live editing)
+
+Run the *same* `install.sh` from the checkout. The Cockpit page becomes symlinks
+into the checkout, so editing `headscale.js` changes what the browser loads on
+the next reload.
+
+```sh
+cp .envdefault .env         # TESTS ONLY, gitignored - see below
+sudo ./install.sh
+sudo ./install.sh --with-units    # only if you really want the unit rendered
 sudo ./install.sh --uninstall
-DESTDIR=/tmp/stage ./install.sh  # stage for packaging
 ```
 
-`install.sh` validates `manifest.json` before copying (a malformed manifest
-makes Cockpit drop the package silently) and removes files left over from
-previous versions. Cockpit picks the package up on the next page load;
-restarting `cockpit.service` is not required, though a hard reload
-(<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd>) clears the browser's cached
-manifest list.
+**`--user` is gone.** It installed into `~/.local/share/cockpit`, which cannot
+hold a `/usr/local/sbin` helper — so the page it produced had no backend, which
+is the same defect this version exists to fix, in a different disguise. A dev
+install is now how you get live editing.
 
-Files installed:
+`DESTDIR=` still works, and stages every destination under one root, which is how
+the whole flow is tested without touching a live host.
+
+### Which install is this host running?
+
+```sh
+for d in /usr/share/cockpit/*/; do
+    n=${d%/}; n=${n##*/}
+    t=$(readlink -f "$d/index.html" 2>/dev/null) || continue
+    case $t in
+      */ai-orchestrator-storage/*) k="DEV  (share)";;
+      /opt/*)                                    k="prod (/opt)";;
+      "")                                        k="?? no index.html";;
+      *)                                         k="OTHER";;
+    esac
+    printf '%-12s %s  %s\n' "$n" "$k" "$t"
+done
+```
+
+> The snippet matches on `*/ai-orchestrator-storage/*` rather than the full
+> share path, and this table says "retired checkout path" rather than spelling
+> one. That is not squeamishness: `README.md` ships to the install path, and
+> check 9 greps every shipped file for the dev root and for the retired
+> `/opt/sc/...` prefix. The check is deliberately blunt - it cannot tell prose
+> from a hardcoded path, and an exemption list for "files where it is only
+> documentation" is a list that grows until the check means nothing. Rewording
+> two lines is the cheaper half of that trade, and the wildcard match is better
+> documentation anyway: it works wherever the share is mounted.
+
+
+Or read `/etc/cockpit-headscale/install.conf`. Neither script ever restarts
+`cockpit.socket`; Cockpit picks the package up on the next page load, and a hard
+reload (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd>) clears the browser's
+cached manifest list.
+
+### Windows
+
+`deploy.ps1` and `deploy.bat` exist and **refuse, with an explanation**. This is
+a Cockpit plugin and Cockpit is Linux-only, so there is no Windows payload here.
+They exist rather than being absent because an absent `deploy.ps1` reads as an
+oversight and the next person writes one. To enrol a Windows machine into the
+tailnet, run `hs-admin client-config --os windows` on the control server.
+
+---
+
+## Configuration: `.envdefault` → `[install path]/.env`
+
+**This project needs this more than any other in the tree.** headscale is
+packaged by no distribution: there is no `/usr/bin/headscale` a package manager
+put there and no canonical config path. Whoever installed it chose — a snap, a
+tarball, a container — and that choice is not discoverable, only recorded.
+
+`.envdefault` is committed and fully commented. `deploy.sh` copies it to
+`[install path]/.env` **only when that file does not exist**. The keys that
+matter:
+
+| key | what it decides |
+|---|---|
+| `HEADSCALE_BIN` | the binary. Required; there is no distribution layout to fall back to |
+| `HEADSCALE_CONFIG` | `config.yaml`. Must be passed explicitly on every call — the binary's compiled-in default does not exist under the snap |
+| `HEADSCALE_UNIT` | the systemd unit, when it has a name nothing would guess |
+| `HEADSCALE_SOCKET` | override only; empty means "read `unix_socket:` from the config", so there is one source of truth |
+| `HS_POLICY_FILE`, `HS_ACL_POLICY_FILE` | the two policy files, seeded missing-only to the paths these keys name |
+| `HS_POLICY_INTERVAL` | reconcile period, read by the unit and by `hs-policy` |
+
+**The page does not read this file.** It asks `hs-admin status`, which does. A
+page carrying its own candidate list would be a second copy of the same decision,
+and the two would drift — which is exactly what the old `BIN_CANDIDATES` array
+was. That array survives as a *fallback* for a host where `hs-admin` is not
+installed, so a half-installed machine still renders a diagnosis naming the
+missing file and the `.env` key instead of looking like headscale is absent.
+
+**A `.env` in this checkout is TESTS ONLY and is gitignored.** A deployed helper
+cannot read it: resolution is `$HS_ADMIN_ENV` (non-root only, owner-checked) →
+`ENV_FILE=` from `/etc/cockpit-headscale/install.conf` → **fail, naming
+install.conf**. There is no "look beside me" step, because that step would land
+in the checkout on a dev install. Run `hs-admin status` as root with
+`HS_ADMIN_ENV` set and it tells you it is ignoring it.
+
+A deployed `.env` carries **locations and settings, never secrets**. Preauth keys
+and API keys are minted by headscale, returned to the caller once, and written
+nowhere.
+
+---
+
+## The helpers, and why each one ships
+
+| helper | shipped? | why |
+|---|---|---|
+| `hs-admin` | **yes** | THE root entry point. Every headscale query needs root — the control socket sits in a `drwx------ root root` directory — so there is no unprivileged path that could substitute. It was installed on this host by hand and referenced **zero times** by this project's installer, so a fresh clone produced a page with nothing behind it. |
+| `hs-policy` | **yes** | The subnet-router reconciler. Run by an operator (`hs-policy check`) and in a loop by `hs-policy-watch.service`. |
+
+There is no `hs-policy-watch` executable: the unit runs `hs-policy` in a shell
+loop so the interval is visible in the unit rather than hidden in a script. That
+is a deliberate difference from `cockpit-wireguard`, whose watcher has real work
+to do between ticks.
+
+Not shipped: `check.sh`, `.git/`, any `.env`.
+
+**The completeness gate.** `install.sh` carries one declaration (`PAGE`,
+`HELPERS`, `LIBS`, `UNITS`, `SEEDS`, `REQUIRED_ENV`) that `deploy.sh` *sources*
+rather than restates. Nine pre-flight checks refuse before anything is written;
+check 3 greps the shipped page files for `/usr/local/sbin/<x>` literals and
+refuses any hit `HELPERS` does not install. That is why `headscale.js` pins
+`var HS_ADMIN = "/usr/local/sbin/hs-admin";` in one top-of-file constant — a path
+assembled at runtime is invisible to that grep.
+
+The manifest condition is `{"path-exists": "/usr/local/sbin/hs-admin"}`: a
+Cockpit condition may test only paths this project's own `install.sh` creates,
+because an unmet condition makes the plugin **silently absent**. Anything an
+operator configures is checked at runtime and reported *in the page*.
+
+---
+
+## Conformance
+
+Against `cockpit-secrets/source/docs/DEPLOY-CONTRACT.md`, checked 2026-09-07:
+
+| | |
+|---|---|
+| Deploys to `/opt/<project>`, payload versioned, `.env` a sibling | yes |
+| `install.sh` resolves itself with `readlink -f`; links, never copies | yes |
+| Per-file symlinks into a real `/usr/share/cockpit/headscale` directory | yes |
+| Refuses a `/usr/local/sbin` entry it does not own | yes |
+| Writes `/etc/cockpit-headscale/install.conf` | yes |
+| Renders units; never enables, starts or stops them | yes |
+| Never touches `cockpit.socket` | yes |
+| No `rm -r` outside `remove_old_payload`'s three assertions | yes |
+| `--uninstall` removes only declared entries and names the data it kept | yes |
+| `.envdefault` in the §4.1 grammar; helpers resolve `.env` via `install.conf` | yes |
+| All nine pre-flight checks and the post-install assertion present | yes |
+| No retired checkout path and no dev-root literal in any shipped file | yes |
+
+Files installed as symlinks:
 
 ```
-manifest.json   menu entry, keywords, Cockpit version requirement
+manifest.json   menu entry, keywords, Cockpit version requirement, condition
 index.html      page shell
 headscale.js    all logic
 headscale.css   all styling, both themes
 ```
-
 
 ## Notes on this host's headscale (the snap)
 
@@ -241,13 +416,19 @@ These files cover that gap.
 
 | File | Purpose |
 |---|---|
-| `acl-policy.hujson` | ACL policy. `autoApprovers` is the declarative form of route approval. |
-| `routing-policy.json` | The host state a subnet router needs: forwarding sysctls, the advertised set, required chain ordering. |
-| `hs-policy` | `check` / `apply` / `status` reconciler. |
-| `hs-policy-watch.service` | Runs `hs-policy apply` every 30s. |
+| `etcdefaults/acl-policy.hujson` | ACL policy seed. `autoApprovers` is the declarative form of route approval. Seeded missing-only to the path `HS_ACL_POLICY_FILE` names. |
+| `etcdefaults/routing-policy.json` | The host state a subnet router needs: forwarding sysctls, the advertised set, required chain ordering. Seeded missing-only to `HS_POLICY_FILE`. |
+| `hs-policy` | `check` / `apply` / `status` reconciler. Reads its policy path from the deployed `.env`. |
+| `systemd/hs-policy-watch.service.in` | Template. Rendered by `install.sh` to run `hs-policy apply` every `HS_POLICY_INTERVAL` seconds. |
 
-Install with `sudo ./install.sh --with-policy`, then
-`systemctl enable --now hs-policy-watch.service`.
+Deploy with `sudo ./deploy.sh --with-policy`, which renders the unit **and**
+enables it. `install.sh` alone renders it and stops there: enabling a daemon that
+rewrites sysctls and firewall rules is a decision, not a side effect of
+installing a web page.
+
+Both seeds are **missing-only**. A re-install never overwrites an ACL policy —
+that file decides which routes are auto-approved, and clobbering one would
+silently change who can reach what.
 
 ### Why this is narrower than the WireGuard equivalent
 

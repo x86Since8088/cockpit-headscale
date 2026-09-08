@@ -73,6 +73,64 @@ PROG=${0##*/}
 R=            # result of the last R-returning helper
 HS_ERR=       # last headscale CLI diagnostic
 
+# ------------------------------------------------- deployed configuration --
+# DEPLOY-CONTRACT.md sections 4.1/4.3. Resolution order, and there is no step 4:
+#   1. $HS_ADMIN_ENV - non-root only, owner-checked. TESTS ONLY. An environment
+#      variable that redirects a ROOT process's configuration is a privilege
+#      escalation, whether or not the file holds a secret.
+#   2. ENV_FILE= out of /etc/cockpit-headscale/install.conf, written by
+#      install.sh. The normal path, and the only one on a production host.
+#   3. Fail, naming install.conf.
+# No "look beside me" step: this file is reached through a symlink into the
+# payload, and resolving .env relative to itself would read the dev checkout's
+# test .env on a dev install.
+INSTALL_CONF="/etc/cockpit-headscale/install.conf"
+declare -A CFG=()
+
+cfg_parse() {
+    local file=$1 n=0 line k v
+    [[ -r $file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z $line || ${line:0:1} == "#" ]] && continue
+        [[ $line == *=* ]] || { printf 'hs-admin: %s:%d: not KEY=VALUE\n' "$file" "$n" >&2; return 1; }
+        k=${line%%=*}; v=${line#*=}
+        k=${k%"${k##*[![:space:]]}"}
+        v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+        [[ $k =~ ^[A-Z][A-Z0-9_]*$ ]] || { printf 'hs-admin: %s:%d: bad key %s\n' "$file" "$n" "$k" >&2; return 1; }
+        [[ ${#v} -ge 2 && ${v:0:1} == '"' && ${v: -1} == '"' ]] && v=${v:1:-1}
+        case $v in *'$'*|*'`'*) printf 'hs-admin: %s:%d: %s contains $ or ` - no interpolation\n' "$file" "$n" "$k" >&2; return 1 ;; esac
+        CFG["$k"]=$v
+    done < "$file"
+    return 0
+}
+
+CFG_ERROR=""
+cfg_load() {
+    local envfile="" conf_env
+    if [[ -n ${HS_ADMIN_ENV:-} ]]; then
+        if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+            printf 'hs-admin: ignoring HS_ADMIN_ENV - a root helper is configured by %s only\n' "$INSTALL_CONF" >&2
+        elif [[ -O ${HS_ADMIN_ENV} && -r ${HS_ADMIN_ENV} ]]; then
+            envfile=${HS_ADMIN_ENV}
+        else
+            printf 'hs-admin: ignoring HS_ADMIN_ENV - not a readable file you own\n' >&2
+        fi
+    fi
+    if [[ -z $envfile ]]; then
+        cfg_parse "$INSTALL_CONF" || { CFG_ERROR="no usable $INSTALL_CONF - run install.sh"; return 1; }
+        conf_env=${CFG[ENV_FILE]:-}
+        CFG=()
+        [[ -n $conf_env ]] || { CFG_ERROR="$INSTALL_CONF does not set ENV_FILE - re-run install.sh"; return 1; }
+        envfile=$conf_env
+    fi
+    cfg_parse "$envfile" || { CFG_ERROR="could not read $envfile"; return 1; }
+    return 0
+}
+
+cfg_load || true    # deferred; --help works on an uninstalled box
+
 # --------------------------------------------------------------------------
 # Destination catalogue for this host (EDT1). The UI must never hardcode a
 # subnet; `hs-admin catalogue` hands it these and `--routes` accepts the ids.
@@ -139,11 +197,20 @@ jqn() { "$JQ" -M -n "$@"; }
 # --------------------------------------------------------------------------
 # locate the binary, the config and the service unit
 # --------------------------------------------------------------------------
+# WHY THIS READS A CONFIG FILE AT ALL. headscale is packaged by no distribution,
+# so its binary, its config and its socket are wherever the operator put them.
+# That is precisely what a deployed .env is for: HEADSCALE_BIN records the
+# decision once, and this helper is the only thing that has to know it - the
+# Cockpit page asks `hs-admin status` rather than carrying a candidate list it
+# would have to keep in step.
+#
+# The candidate search below is kept as a FALLBACK for an unconfigured box, so a
+# half-installed host still reports something true instead of nothing.
 find_bin() {
     local c
-    if [[ -n ${HS_BIN:-} ]]; then
-        [[ -x $HS_BIN ]] || return 1
-        echo "$HS_BIN"; return 0
+    if [[ -n ${CFG[HEADSCALE_BIN]:-} ]]; then
+        [[ -x ${CFG[HEADSCALE_BIN]} ]] || return 1
+        echo "${CFG[HEADSCALE_BIN]}"; return 0
     fi
     # The snap's real binary first: no `snap run` confinement round-trip, and
     # `current` is a stable symlink maintained across snap revisions.
@@ -160,9 +227,9 @@ find_bin() {
 
 find_cfg() {
     local c
-    if [[ -n ${HS_CONFIG:-} ]]; then
-        [[ -r $HS_CONFIG ]] || return 1
-        echo "$HS_CONFIG"; return 0
+    if [[ -n ${CFG[HEADSCALE_CONFIG]:-} ]]; then
+        [[ -r ${CFG[HEADSCALE_CONFIG]} ]] || return 1
+        echo "${CFG[HEADSCALE_CONFIG]}"; return 0
     fi
     for c in /var/snap/headscale/common/config.yaml \
              /etc/headscale/config.yaml \
@@ -174,6 +241,9 @@ find_cfg() {
 
 find_unit() {
     local u
+    if [[ -n ${CFG[HEADSCALE_UNIT]:-} ]]; then
+        echo "${CFG[HEADSCALE_UNIT]}"; return 0
+    fi
     for u in snap.headscale.headscaled.service headscale.service; do
         if systemctl cat "$u" >/dev/null 2>&1; then echo "$u"; return 0; fi
     done
@@ -398,7 +468,13 @@ v_status() {
 
     # The snap manifest carries the real upstream version. The binary in this
     # snap reports "dev" for `headscale version`, which is useless in a UI.
-    if [[ -r /snap/headscale/current/meta/snap.yaml ]]; then
+    #
+    # Only consult it when the binary we actually resolved IS the snap's. Before
+    # HEADSCALE_BIN existed the snap was the only possibility, so this was safe;
+    # now that an operator can point the helper at a tarball install, reading the
+    # snap's manifest would report the version of a binary this host is not
+    # running.
+    if [[ ${HS_BIN_R:-} == /snap/* && -r /snap/headscale/current/meta/snap.yaml ]]; then
         version=$(awk -F': *' '/^version:/{print $2; exit}' /snap/headscale/current/meta/snap.yaml)
         [[ -n $version ]] && vsrc="snap"
     fi
@@ -424,7 +500,7 @@ v_status() {
         --arg server_url  "$(server_url)" \
         --arg metrics_listen_addr "$(cfg_get metrics_listen_addr || true)" \
         --arg grpc_listen_addr    "$(cfg_get grpc_listen_addr || true)" \
-        --arg socket  "$(cfg_get unix_socket || true)" \
+        --arg socket  "${CFG[HEADSCALE_SOCKET]:-$(cfg_get unix_socket || true)}" \
         --arg config  "${HS_CFG_R:-}" \
         --arg bin     "${HS_BIN_R:-}" \
         --arg service "$unit" \
